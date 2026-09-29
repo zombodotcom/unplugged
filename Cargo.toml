@@ -1,0 +1,28 @@
+[package]
+name = "unplugged"
+version = "0.1.0"
+description = "Play electric guitar DI and hear it as an acoustic - a tiny multitrack recorder"
+license = "MIT"
+repository = "https://github.com/zombodotcom/unplugged"
+edition = "2024"
+
+[dependencies]
+anyhow = "1"
+cpal = "0.18"
+eframe = "0.36"
+egui = "0.36"
+hound = "3.5"
+parking_lot = "0.12"
+realfft = "3.5.0"
+rfd = "0.17"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[features]
+# Low-latency ASIO driver support (Focusrite ships an ASIO driver). Needs the ASIO SDK
+# and LLVM installed - see README.
+asio = ["cpal/asio"]
+
+[profile.dev]
+# Audio DSP is too slow unoptimised; keep debug builds usable.
+opt-level = 2
