@@ -74,7 +74,7 @@ Run tests with `cargo test`.
 
 ## Contributing
 
-Issues and PRs welcome. Some ideas: MP3/FLAC export, a tuner, clip splitting/trimming, undo, CLAP/VST plugin hosting, loop recording.
+Issues and PRs welcome. See [ROADMAP.md](ROADMAP.md) for the plan: social-media export presets, OBS sync, and a shareable re-toneable song format.
 
 ## License
 
