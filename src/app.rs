@@ -91,7 +91,8 @@ impl App {
         visuals.hyperlink_color = AMBER;
         cc.egui_ctx.set_visuals(visuals);
 
-        let host = cpal::default_host().id();
+        let saved = audio::SavedDevices::load();
+        let host = saved.host().unwrap_or_else(|| cpal::default_host().id());
         let mut app = Self {
             engine: Arc::new(Mutex::new(Engine::new(48000.0))),
             queue: Default::default(),
@@ -103,7 +104,7 @@ impl App {
             in_idx: 0,
             out_idx: 0,
             in_channel: 0,
-            buffer: None,
+            buffer: saved.buffer,
             audio: None,
             show_audio: false,
             sim: SimParams::default(),
@@ -130,6 +131,26 @@ impl App {
         self.in_channel = inputs
             .get(self.in_idx)
             .map_or(0, |d| audio::default_input_channel(&d.name));
+        // Prefer whatever the user picked last time, if those devices are still around.
+        let saved = audio::SavedDevices::load();
+        if saved.host() == Some(self.host) {
+            if let Some(i) = saved
+                .input
+                .and_then(|n| inputs.iter().position(|d| d.name == n))
+            {
+                self.in_idx = i;
+                self.in_channel = saved
+                    .channel
+                    .filter(|&c| c < inputs[i].channels)
+                    .unwrap_or(self.in_channel);
+            }
+            if let Some(o) = saved
+                .output
+                .and_then(|n| outputs.iter().position(|d| d.name == n))
+            {
+                self.out_idx = o;
+            }
+        }
         self.inputs = inputs;
         self.outputs = outputs;
     }
@@ -172,6 +193,14 @@ impl App {
         }
         match result {
             Ok(a) => {
+                audio::SavedDevices {
+                    host: Some(self.host.name().to_string()),
+                    input: Some(input.name.clone()),
+                    output: Some(output.name.clone()),
+                    channel: Some(self.in_channel),
+                    buffer: self.buffer,
+                }
+                .save();
                 let is_scarlett = audio::pick_scarlett(std::slice::from_ref(input)).is_some();
                 let warn = if is_scarlett {
                     ""
@@ -421,6 +450,13 @@ impl App {
     fn audio_window(&mut self, ctx: &egui::Context) {
         let mut open = self.show_audio;
         let mut restart = false;
+        let before = (
+            self.host,
+            self.in_idx,
+            self.out_idx,
+            self.in_channel,
+            self.buffer,
+        );
         egui::Window::new("Audio settings")
             .open(&mut open)
             .resizable(false)
@@ -512,7 +548,7 @@ impl App {
                     });
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
-                    if ui.button("Apply / restart audio").clicked() {
+                    if ui.button("Restart audio").clicked() {
                         restart = true;
                     }
                     if ui.button("Rescan devices").clicked() {
@@ -533,6 +569,18 @@ impl App {
             );
             });
         self.show_audio = open;
+        // Any device/channel/buffer change takes effect right away.
+        if before
+            != (
+                self.host,
+                self.in_idx,
+                self.out_idx,
+                self.in_channel,
+                self.buffer,
+            )
+        {
+            restart = true;
+        }
         if restart {
             self.stop();
             self.start_audio(ctx);

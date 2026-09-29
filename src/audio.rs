@@ -90,6 +90,45 @@ pub fn default_input_channel(name: &str) -> u16 {
     }
 }
 
+/// The devices the user last ran with, remembered between launches.
+#[derive(serde::Serialize, serde::Deserialize, Default)]
+pub struct SavedDevices {
+    pub host: Option<String>,
+    pub input: Option<String>,
+    pub output: Option<String>,
+    pub channel: Option<u16>,
+    pub buffer: Option<u32>,
+}
+
+impl SavedDevices {
+    fn path() -> Option<std::path::PathBuf> {
+        std::env::var_os("APPDATA").map(|a| {
+            std::path::PathBuf::from(a)
+                .join("Unplugged")
+                .join("devices.json")
+        })
+    }
+
+    pub fn load() -> Self {
+        Self::path()
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .and_then(|t| serde_json::from_str(&t).ok())
+            .unwrap_or_default()
+    }
+
+    pub fn save(&self) {
+        if let Some(p) = Self::path() {
+            let _ = std::fs::create_dir_all(p.parent().unwrap());
+            let _ = std::fs::write(p, serde_json::to_string_pretty(self).unwrap_or_default());
+        }
+    }
+
+    pub fn host(&self) -> Option<HostId> {
+        let name = self.host.as_deref()?;
+        hosts().into_iter().find(|h| h.name() == name)
+    }
+}
+
 pub struct AudioSettings {
     pub host: HostId,
     pub input: Device,
@@ -366,5 +405,55 @@ mod tests {
             r.push((i as f32 * 0.01).sin(), |_| n += 1);
         }
         assert!((n as i32 - 44100).abs() <= 1, "{n}");
+    }
+}
+
+/// Real-hardware check: `cargo test --release -- --ignored realtek --nocapture`
+#[cfg(test)]
+mod hw_tests {
+    use super::*;
+
+    #[test]
+    #[ignore]
+    fn scarlett_in_realtek_out() {
+        let host = cpal::default_host().id();
+        let (ins, outs) = list_devices(host);
+        let input = &ins[pick_scarlett(&ins).expect("no scarlett")];
+        for out in outs.iter().filter(|d| d.name.contains("Realtek")) {
+            let engine = Arc::new(Mutex::new(Engine::new(48000.0)));
+            {
+                let mut e = engine.lock();
+                e.monitor = false; // silent
+                e.play();
+            }
+            let errors: ErrorSlot = Default::default();
+            let s = AudioSettings {
+                host,
+                input: input.device.clone(),
+                output: out.device.clone(),
+                input_channel: 1,
+                buffer: None,
+            };
+            match start(
+                &s,
+                engine.clone(),
+                Default::default(),
+                errors.clone(),
+                || {},
+            ) {
+                Ok(a) => {
+                    std::thread::sleep(std::time::Duration::from_millis(1500));
+                    let e = engine.lock();
+                    println!(
+                        "{} -> OK: {} | frames rendered {} | err {:?}",
+                        out.name,
+                        a.description,
+                        e.playhead,
+                        errors.lock()
+                    );
+                }
+                Err(e) => println!("{} -> FAILED: {e:#}", out.name),
+            }
+        }
     }
 }
