@@ -2,6 +2,7 @@ use crate::audio::{self, DeviceInfo, ErrorSlot, InputQueue, RunningAudio};
 use crate::dsp::{IrSpectrum, SimParams, builtin_body_ir};
 use crate::engine::{Engine, PEAK_BUCKET, TrackView, render_mix};
 use crate::project;
+use crate::share::{self, PRESETS, ShareOptions};
 use cpal::HostId;
 use egui::{
     Align2, Color32, FontId, Key, Pos2, Rect, RichText, Sense, Stroke, UiBuilder, pos2, vec2,
@@ -18,6 +19,21 @@ const CTRL_W: f32 = 290.0;
 const AMBER: Color32 = Color32::from_rgb(232, 170, 80);
 const BLUE: Color32 = Color32::from_rgb(110, 160, 230);
 const REC_RED: Color32 = Color32::from_rgb(220, 60, 60);
+
+/// State of the Share window.
+#[derive(Default)]
+struct ShareUi {
+    open: bool,
+    preset: usize,
+    opts: ShareOptions,
+    clip: bool,
+    from: f32,
+    to: f32,
+    ffmpeg: Option<PathBuf>,
+    /// `Some(None)` while exporting, `Some(Some(result))` when finished.
+    job: Arc<Mutex<Option<Option<Result<String, String>>>>>,
+    result: Option<String>,
+}
 
 /// Engine settings the UI edits directly.
 #[derive(Clone, PartialEq)]
@@ -82,6 +98,7 @@ pub struct App {
     out_meter: f32,
     project_dir: Option<PathBuf>,
     take_counter: usize,
+    share: ShareUi,
 }
 
 impl App {
@@ -117,6 +134,7 @@ impl App {
             out_meter: 0.0,
             project_dir: None,
             take_counter: 0,
+            share: ShareUi::default(),
         };
         app.refresh_devices();
         app.start_audio(&cc.egui_ctx);
@@ -426,10 +444,20 @@ impl App {
         }
     }
 
-    fn export_mix(&mut self) {
-        let Some(path) = rfd::FileDialog::new()
-            .add_filter("WAV audio", &["wav"])
-            .set_file_name("mix.wav")
+    fn open_share(&mut self) {
+        self.share.open = true;
+        self.share.ffmpeg = share::find_ffmpeg();
+    }
+
+    fn start_share(&mut self) {
+        let preset = &PRESETS[self.share.preset];
+        let base = match self.share.opts.title.trim() {
+            "" => "song".to_string(),
+            t => t.replace(|c: char| !c.is_alphanumeric() && c != ' ' && c != '-', ""),
+        };
+        let Some(out) = rfd::FileDialog::new()
+            .add_filter(preset.name, &[preset.extension()])
+            .set_file_name(format!("{base}-{}.{}", preset.id, preset.extension()))
             .save_file()
         else {
             return;
@@ -438,11 +466,162 @@ impl App {
             let e = self.engine.lock();
             (e.views(), e.ir(), e.sr)
         };
-        let mix = render_mix(&tracks, &self.sim, ir, sr);
-        self.status = match project::export_mix(&path, &mix, sr as u32) {
-            Ok(()) => format!("Exported {}", path.display()),
-            Err(e) => format!("Export failed: {e:#}"),
+        if tracks.is_empty() {
+            self.share.result = Some("Record something first.".into());
+            return;
+        }
+        let sim = self.sim.clone();
+        let opts = self.share.opts.clone();
+        let clip = self.share.clip.then_some((self.share.from, self.share.to));
+        let job = self.share.job.clone();
+        *job.lock() = Some(None);
+        self.share.result = None;
+        std::thread::spawn(move || {
+            let run = || -> anyhow::Result<String> {
+                let mut mix = render_mix(&tracks, &sim, ir, sr);
+                if let Some((from, to)) = clip {
+                    let frames = mix.len() / 2;
+                    let a = ((from * sr) as usize).min(frames);
+                    let b = ((to * sr) as usize).min(frames);
+                    anyhow::ensure!(b > a, "The clip end must be after its start.");
+                    mix = mix[a * 2..b * 2].to_vec();
+                    share::fade_edges(&mut mix, sr as u32, 0.02, 0.5);
+                }
+                Ok(share::export(&mix, sr as u32, preset, &opts, &out)?.summary())
+            };
+            *job.lock() = Some(Some(run().map_err(|e| format!("Export failed: {e:#}"))));
+        });
+    }
+
+    fn share_window(&mut self, ctx: &egui::Context, snap: &Snapshot) {
+        // Pick up a finished export.
+        let finished = {
+            let mut job = self.share.job.lock();
+            match job.take() {
+                Some(Some(r)) => Some(r),
+                other => {
+                    *job = other;
+                    None
+                }
+            }
         };
+        if let Some(r) = finished {
+            self.share.result = Some(match r {
+                Ok(s) | Err(s) => s,
+            });
+        }
+        let busy = self.share.job.lock().is_some();
+
+        let mut open = self.share.open;
+        egui::Window::new("Share / Export")
+            .open(&mut open)
+            .resizable(false)
+            .default_width(460.0)
+            .show(ctx, |ui| {
+                let ffmpeg = self.share.ffmpeg.is_some();
+                ui.label(RichText::new("Where's it going?").strong());
+                for (i, p) in PRESETS.iter().enumerate() {
+                    ui.add_enabled_ui(ffmpeg || !p.needs_ffmpeg(), |ui| {
+                        ui.horizontal(|ui| {
+                            ui.radio_value(&mut self.share.preset, i, p.name);
+                            ui.label(RichText::new(p.hint).small().weak());
+                        });
+                    });
+                }
+                if !ffmpeg {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(RichText::new(share::FFMPEG_HELP).small().color(AMBER));
+                        if ui.small_button("Check again").clicked() {
+                            self.share.ffmpeg = share::find_ffmpeg();
+                        }
+                    });
+                }
+                let preset = &PRESETS[self.share.preset];
+
+                ui.separator();
+                egui::Grid::new("share_grid").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
+                    ui.label("Title");
+                    ui.text_edit_singleline(&mut self.share.opts.title);
+                    ui.end_row();
+                    ui.label("Artist");
+                    ui.text_edit_singleline(&mut self.share.opts.artist);
+                    ui.end_row();
+                    if preset.needs_ffmpeg() {
+                        ui.label("Cover picture");
+                        ui.horizontal(|ui| {
+                            let name = self.share.opts.cover.as_ref().and_then(|p| p.file_name()).map_or(
+                                "none (plain background)".to_string(),
+                                |n| n.to_string_lossy().to_string(),
+                            );
+                            ui.label(name);
+                            if ui.small_button("Pick…").clicked()
+                                && let Some(p) = rfd::FileDialog::new()
+                                    .add_filter("Images", &["png", "jpg", "jpeg", "webp", "bmp"])
+                                    .pick_file()
+                                {
+                                    self.share.opts.cover = Some(p);
+                                }
+                            if self.share.opts.cover.is_some() && ui.small_button("✖").clicked() {
+                                self.share.opts.cover = None;
+                            }
+                        });
+                        ui.end_row();
+                    }
+                    ui.label("Loudness");
+                    ui.horizontal(|ui| {
+                        ui.checkbox(&mut self.share.opts.normalize, "Match to").on_hover_text(
+                            "Most platforms play everything at about -14 LUFS. Matching it means yours isn't turned down or squashed.",
+                        );
+                        ui.add_enabled(
+                            self.share.opts.normalize,
+                            egui::DragValue::new(&mut self.share.opts.target_lufs)
+                                .range(-24.0..=-8.0)
+                                .speed(0.1)
+                                .suffix(" LUFS"),
+                        );
+                    });
+                    ui.end_row();
+                    ui.label("What");
+                    ui.horizontal(|ui| {
+                        ui.radio_value(&mut self.share.clip, false, "Whole song");
+                        ui.radio_value(&mut self.share.clip, true, "Clip");
+                    });
+                    ui.end_row();
+                    if self.share.clip {
+                        let now = snap.playhead as f32 / snap.sr;
+                        ui.label("");
+                        ui.horizontal(|ui| {
+                            ui.add(egui::DragValue::new(&mut self.share.from).range(0.0..=36000.0).speed(0.1).suffix(" s"));
+                            if ui.small_button("at playhead").on_hover_text("Start the clip at the playhead").clicked() {
+                                self.share.from = now;
+                            }
+                            ui.label("to");
+                            ui.add(egui::DragValue::new(&mut self.share.to).range(0.0..=36000.0).speed(0.1).suffix(" s"));
+                            if ui.small_button("at playhead").on_hover_text("End the clip at the playhead").clicked() {
+                                self.share.to = now;
+                            }
+                        });
+                        ui.end_row();
+                    }
+                });
+
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    let can = !busy && (ffmpeg || !preset.needs_ffmpeg());
+                    if ui.add_enabled(can, egui::Button::new(RichText::new("Export…").strong())).clicked() {
+                        self.start_share();
+                    }
+                    if busy {
+                        ui.spinner();
+                        ui.label(if preset.needs_ffmpeg() { "Rendering video…" } else { "Exporting…" });
+                    }
+                });
+                if let Some(r) = &self.share.result {
+                    ui.add_space(4.0);
+                    ui.label(RichText::new(r).small());
+                }
+            });
+        self.share.open = open;
     }
 
     // ---- UI pieces ---------------------------------------------------------
@@ -600,11 +779,16 @@ impl App {
         ui.add_enabled_ui(self.sim.enabled, |ui| {
             ui.checkbox(&mut self.sim.pickup_eq, "Pickup correction EQ")
                 .on_hover_text("Cuts the mid honk and pickup resonance of magnetic pickups");
-            ui.add(egui::Slider::new(&mut self.sim.body, 0.0..=1.0).text("Body"));
-            ui.add(egui::Slider::new(&mut self.sim.brightness_db, -6.0..=14.0).text("Sparkle dB"));
-            ui.add(egui::Slider::new(&mut self.sim.warmth_db, -6.0..=10.0).text("Warmth dB"));
-            ui.add(egui::Slider::new(&mut self.sim.room, 0.0..=1.0).text("Room"));
-            ui.add(egui::Slider::new(&mut self.sim.level_db, -18.0..=12.0).text("Level dB"));
+            ui.add(egui::Slider::new(&mut self.sim.body, 0.0..=1.0).text("Body"))
+                .on_hover_text("How much wooden guitar body you hear. 0 = plain electric, 1 = full acoustic body resonance.");
+            ui.add(egui::Slider::new(&mut self.sim.brightness_db, -6.0..=14.0).text("Sparkle dB"))
+                .on_hover_text("Treble shimmer / string zing. Electric pickups lose the airy top end an acoustic has; this adds it back.");
+            ui.add(egui::Slider::new(&mut self.sim.warmth_db, -6.0..=10.0).text("Warmth dB"))
+                .on_hover_text("Low 'boom' of the hollow body. Turn down if it sounds muddy or boomy.");
+            ui.add(egui::Slider::new(&mut self.sim.room, 0.0..=1.0).text("Room"))
+                .on_hover_text("Small-room echo, like playing in a bedroom instead of inside your headphones. 0 = dry.");
+            ui.add(egui::Slider::new(&mut self.sim.level_db, -18.0..=12.0).text("Level dB"))
+                .on_hover_text("Volume after the sim. Use it if the acoustic sound is louder or quieter than you want.");
             ui.add_space(4.0);
             ui.label(format!("Body IR: {}", snap.ir_name));
             ui.horizontal(|ui| {
@@ -612,14 +796,12 @@ impl App {
                     .button("Load IR…")
                     .on_hover_text("Any acoustic-sim impulse response .wav")
                     .clicked()
-                {
-                    if let Some(p) = rfd::FileDialog::new()
+                    && let Some(p) = rfd::FileDialog::new()
                         .add_filter("WAV", &["wav"])
                         .pick_file()
                     {
                         self.set_ir(Some(p));
                     }
-                }
                 if ui.button("Built-in").clicked() {
                     self.set_ir(None);
                 }
@@ -995,10 +1177,13 @@ impl eframe::App for App {
                     if ui.button("Import WAV as track…").clicked() {
                         self.import_wav();
                     }
-                    if ui.button("Export mix (WAV)…").clicked() {
-                        self.export_mix();
+                    if ui.button("Share / Export…").clicked() {
+                        self.open_share();
                     }
                 });
+                if ui.button("Share").clicked() {
+                    self.open_share();
+                }
                 if ui.button("Audio settings").clicked() {
                     self.show_audio = true;
                 }
@@ -1031,6 +1216,7 @@ impl eframe::App for App {
         egui::CentralPanel::default().show(ui, |ui| self.timeline(ui, &snap, &mut actions));
 
         self.audio_window(&ctx);
+        self.share_window(&ctx, &snap);
 
         if knobs != snap.knobs {
             self.apply_knobs(&knobs);
@@ -1185,7 +1371,7 @@ fn meter(ui: &mut egui::Ui, label: &str, level: f32) {
 
 fn row_bg(ui: &egui::Ui, i: usize) -> Color32 {
     let base = ui.visuals().faint_bg_color;
-    if i % 2 == 0 {
+    if i.is_multiple_of(2) {
         base
     } else {
         ui.visuals().extreme_bg_color

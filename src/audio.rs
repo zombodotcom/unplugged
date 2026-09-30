@@ -276,7 +276,7 @@ where
     let mut resampler = LinearResampler::new(cfg.sample_rate, out_sr);
     let started = std::time::Instant::now();
     let stream = s.input.build_input_stream::<T, _, _>(
-        cfg.clone(),
+        *cfg,
         move |data: &[T], _| {
             let mut q = queue.lock();
             for f in data.chunks_exact(channels) {
@@ -308,7 +308,7 @@ where
     let mut calls = 0u32;
     let started = std::time::Instant::now();
     let stream = s.output.build_output_stream::<T, _, _>(
-        cfg.clone(),
+        *cfg,
         move |data: &mut [T], _| {
             let frames = data.len() / channels;
             {
@@ -337,7 +337,7 @@ where
                 }
             }
             calls = calls.wrapping_add(1);
-            if calls % 4 == 0 {
+            if calls.is_multiple_of(4) {
                 repaint();
             }
         },

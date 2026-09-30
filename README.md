@@ -18,9 +18,29 @@ Written in Rust with [cpal](https://github.com/RustAudio/cpal) (audio) and [egui
 - Per-track volume, pan, mute, solo, and an **A** toggle to hear a track acoustic or clean
 - Takes are always **recorded clean** (DI), so you can change the acoustic sound later
 - Metronome with beat grid, latency compensation, and per-track nudge
-- Save/open projects (folder with `project.json` + WAVs), import WAV backing tracks, export a stereo mix (24-bit WAV)
+- Save/open projects (folder with `project.json` + WAVs), import WAV backing tracks
+- **Share / Export** with presets for YouTube, Shorts, TikTok, Reels, X/Facebook, SoundCloud, MP3, Discord and Master WAV (see below)
 - Automatically picks a Scarlett and its instrument input (Input 2 on a Scarlett Solo)
 - Handles interfaces whose input and output run at different sample rates
+
+## Share / Export
+
+**File → Share** (or the **Share** button). Pick where it's going, optionally a title, cover picture and a clip range, then hit **Export**.
+
+- **Loudness matching**: measures EBU R128 loudness and matches it to −14 LUFS (what YouTube, Spotify and SoundCloud play at), with a true-peak limiter at −1 dBTP so nothing distorts after upload.
+- **Audio**: Master WAV (24-bit), FLAC (CD quality, for SoundCloud/Bandcamp), MP3 320k, or small MP3 128k for Discord/messages. These are built in.
+- **Video** (YouTube 16:9, Shorts/TikTok/Reels 9:16, X/Facebook 1:1): your cover picture (or a plain background), a live waveform and your title, as H.264 + AAC 384 kbps MP4. Needs [FFmpeg](https://ffmpeg.org), which is free: `winget install Gyan.FFmpeg`, or drop `ffmpeg.exe` next to `unplugged.exe`.
+
+### Use it with any DAW: `unplugged-share`
+
+The exporter is also a command-line tool, so you can use it on a WAV from Audacity, Reaper or anything else:
+
+```sh
+cargo build --release          # builds target/release/unplugged-share(.exe)
+unplugged-share --list
+unplugged-share song.wav --preset tiktok --title "Wonderwall (acoustic)" --cover art.png --from 42 --to 72
+unplugged-share song.wav -p soundcloud
+```
 
 ## Getting started
 

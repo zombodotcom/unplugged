@@ -32,7 +32,7 @@ Legend: size **S** is about a day, **M** a few days, **L** a week or more. ✅ =
 
 Goal: one **Share** button that produces a correctly formatted file for each platform, plus a **standalone open-source CLI/library** that any DAW's users can run (Audacity, Reaper, anything that exports a WAV).
 
-### 2a. Export presets and encoders
+### 2a. Export presets and encoders ✅ (v0.2)
 
 Each preset sets container, codec, sample rate, bitrate, loudness, peak ceiling, max length and video shape.
 
@@ -45,11 +45,11 @@ Each preset sets container, codec, sample rate, bitrate, loudness, peak ceiling,
 | Discord / text | MP3 or Opus, sized to fit upload limits | Quick "listen to this riff" shares |
 | X / Facebook | MP4 16:9 or 1:1 | |
 
-- **Loudness**: measure with EBU R128 ([`ebur128`](https://crates.io/crates/ebur128) crate). Normalise to about **−14 LUFS** with a true-peak limiter at **−1 dBTP**. YouTube, Spotify and SoundCloud play back at about −14 and Apple Music at −16 ([forasoft](https://www.forasoft.com/learn/audio-for-video/articles-audio/lufs-targets-per-platform-2026)). YouTube advises staying under −1 dBTP to avoid AAC clipping ([peak-studios](https://www.peak-studios.de/en/youtube-audio-richtlinien-streaming-2025/)). TikTok and Instagram publish no official target, so −14 is a safe default. **S–M**
-- **Encoders**: FLAC via [`flacenc`](https://github.com/yotarok/flacenc-rs) (pure Rust), MP3 via [`mp3lame-encoder`](https://crates.io/crates/mp3lame-encoder) (LAME), plus Opus. AAC and H.264 go through **FFmpeg as a separate program**, which keeps Unplugged MIT-licensed without linking GPL/patent-encumbered code. **M**
-- **Clip picker**: drag a region on the timeline to export a 15–60 s social clip, with a fade in/out. **S**
+- ✅ **Loudness**: measure with EBU R128 ([`ebur128`](https://crates.io/crates/ebur128) crate). Normalise to about **−14 LUFS** with a true-peak limiter at **−1 dBTP**. YouTube, Spotify and SoundCloud play back at about −14 and Apple Music at −16 ([forasoft](https://www.forasoft.com/learn/audio-for-video/articles-audio/lufs-targets-per-platform-2026)). YouTube advises staying under −1 dBTP to avoid AAC clipping ([peak-studios](https://www.peak-studios.de/en/youtube-audio-richtlinien-streaming-2025/)). TikTok and Instagram publish no official target, so −14 is a safe default. **S–M**
+- ✅ **Encoders** (Opus still to do): FLAC via [`flacenc`](https://github.com/yotarok/flacenc-rs) (pure Rust), MP3 via [`mp3lame-encoder`](https://crates.io/crates/mp3lame-encoder) (LAME), plus Opus. AAC and H.264 go through **FFmpeg as a separate program**, which keeps Unplugged MIT-licensed without linking GPL/patent-encumbered code. **M**
+- ✅ **Clip picker** (start/end from the playhead; drag-to-select still to do): export a 15–60 s social clip, with a fade in/out. **S**
 
-### 2b. Video for audio-only songs
+### 2b. Video for audio-only songs ✅ (v0.2, basic: FFmpeg filters)
 
 Social platforms want video. Generate one automatically:
 - Waveform or spectrum visualizer, title, artist, cover image or solid colour, and a progress bar
@@ -75,7 +75,7 @@ APIs differ a lot. Be realistic:
 
 OAuth tokens are stored in the OS keychain and never in project files.
 
-### 2e. Standalone exporter crate and CLI
+### 2e. Standalone exporter crate and CLI (CLI ✅ in v0.2; separate crate still to do)
 
 Split 2a–2b into its own crate, `unplugged-share`, with a CLI:
 

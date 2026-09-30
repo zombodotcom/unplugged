@@ -135,12 +135,11 @@ pub fn export_mix(path: &Path, stereo: &[f32], sr: u32) -> Result<()> {
     Ok(())
 }
 
-/// Reads any WAV as mono f32 (channels averaged), resampled to `sr`.
-pub fn read_wav_mono(path: &Path, sr: u32) -> Result<Vec<f32>> {
+/// Reads a WAV as interleaved f32. Returns (samples, channels, sample rate).
+fn read_wav(path: &Path) -> Result<(Vec<f32>, usize, u32)> {
     let mut r =
         hound::WavReader::open(path).with_context(|| format!("can't open {}", path.display()))?;
     let spec = r.spec();
-    let ch = spec.channels as usize;
     let interleaved: Vec<f32> = match spec.sample_format {
         hound::SampleFormat::Float => r.samples::<f32>().collect::<Result<_, _>>()?,
         hound::SampleFormat::Int => {
@@ -150,11 +149,28 @@ pub fn read_wav_mono(path: &Path, sr: u32) -> Result<Vec<f32>> {
                 .collect::<Result<_, _>>()?
         }
     };
+    Ok((interleaved, spec.channels as usize, spec.sample_rate))
+}
+
+/// Reads any WAV as mono f32 (channels averaged), resampled to `sr`.
+pub fn read_wav_mono(path: &Path, sr: u32) -> Result<Vec<f32>> {
+    let (interleaved, ch, file_sr) = read_wav(path)?;
     let mono: Vec<f32> = interleaved
         .chunks(ch)
         .map(|f| f.iter().sum::<f32>() / ch as f32)
         .collect();
-    Ok(resample(&mono, spec.sample_rate, sr))
+    Ok(resample(&mono, file_sr, sr))
+}
+
+/// Reads any WAV as interleaved stereo at its own sample rate (mono is duplicated,
+/// extra channels are dropped). Returns (samples, sample rate).
+pub fn read_wav_stereo(path: &Path) -> Result<(Vec<f32>, u32)> {
+    let (interleaved, ch, sr) = read_wav(path)?;
+    let stereo = interleaved
+        .chunks(ch)
+        .flat_map(|f| [f[0], if ch > 1 { f[1] } else { f[0] }])
+        .collect();
+    Ok((stereo, sr))
 }
 
 /// Linear-interpolation resampler. Good enough for IRs and occasional imports.

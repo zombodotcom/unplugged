@@ -299,7 +299,11 @@ impl Engine {
         if t > len {
             return 0.0;
         }
-        let freq = if beat_idx % 4 == 0 { 1760.0 } else { 1175.0 };
+        let freq = if beat_idx.is_multiple_of(4) {
+            1760.0
+        } else {
+            1175.0
+        };
         (2.0 * PI * freq * t / self.sr).sin() * (-t / (0.006 * self.sr)).exp() * self.click_volume
     }
 

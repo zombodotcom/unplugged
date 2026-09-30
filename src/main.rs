@@ -1,11 +1,5 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-mod app;
-mod audio;
-mod dsp;
-mod engine;
-mod project;
-
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -17,6 +11,6 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "Unplugged",
         options,
-        Box::new(|cc| Ok(Box::new(app::App::new(cc)))),
+        Box::new(|cc| Ok(Box::new(unplugged::app::App::new(cc)))),
     )
 }
