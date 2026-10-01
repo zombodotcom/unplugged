@@ -239,3 +239,30 @@ fn toggles_look_like_buttons() {
     steps(&mut h, 2);
     shot(&mut h, "toggles_off");
 }
+
+#[test]
+fn add_effect_from_menu_and_undo() {
+    use egui_kittest::kittest::Queryable;
+    let mut h = harness();
+    h.get_by_label("Master").click();
+    steps(&mut h, 2);
+    h.get_by_label("➕ Add effect").click();
+    steps(&mut h, 2);
+    h.get_by_label("Reverb").click();
+    steps(&mut h, 2);
+    let kinds: Vec<_> = h.state().doc().master_fx.iter().map(|f| f.kind).collect();
+    assert_eq!(
+        kinds,
+        [
+            unplugged::fx::FxKind::Limiter,
+            unplugged::fx::FxKind::Reverb
+        ]
+    );
+    shot(&mut h, "master_fx");
+    key(&mut h, Key::Z, Modifiers::COMMAND);
+    assert_eq!(
+        h.state().doc().master_fx.len(),
+        1,
+        "undo removes the added effect"
+    );
+}

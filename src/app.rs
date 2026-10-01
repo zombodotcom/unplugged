@@ -1,7 +1,7 @@
 use crate::audio::{self, DeviceInfo, ErrorSlot, InputQueue, RunningAudio};
-use crate::dsp::{IrSpectrum, SimParams, builtin_body_ir};
 use crate::engine::{CAPTURE_SECONDS, Engine, render_mix};
-use crate::model::{Doc, PEAK_BUCKET, Selection};
+use crate::fx::{FxKind, FxSlot};
+use crate::model::{Doc, FxTarget, PEAK_BUCKET, Selection, Song};
 use crate::project;
 use crate::share::{self, PRESETS, ShareOptions};
 use cpal::HostId;
@@ -21,9 +21,17 @@ const CTRL_W: f32 = 300.0;
 const EDGE_PX: f32 = 7.0;
 
 const AMBER: Color32 = Color32::from_rgb(232, 170, 80);
-const BLUE: Color32 = Color32::from_rgb(110, 160, 230);
 const REC_RED: Color32 = Color32::from_rgb(220, 60, 60);
 const SELECT: Color32 = Color32::from_rgb(255, 255, 255);
+/// One colour per track, in order.
+const TRACK_COLOURS: [Color32; 6] = [
+    Color32::from_rgb(110, 160, 230),
+    Color32::from_rgb(232, 170, 80),
+    Color32::from_rgb(120, 200, 140),
+    Color32::from_rgb(190, 140, 230),
+    Color32::from_rgb(230, 120, 150),
+    Color32::from_rgb(90, 200, 210),
+];
 
 /// State of the Share window.
 #[derive(Default)]
@@ -91,7 +99,6 @@ struct Snapshot {
     rec_len: usize,
     sr: f32,
     knobs: Knobs,
-    ir_name: String,
     in_peak: f32,
     out_peak: f32,
 }
@@ -196,7 +203,8 @@ pub struct App {
     confirm_close: bool,
     allow_close: bool,
 
-    sim: SimParams,
+    fx_target: FxTarget,
+    fx_last_sel: Option<Selection>,
     status: String,
     px_per_sec: f32,
     follow: bool,
@@ -254,7 +262,8 @@ impl App {
             saved_rev: 0,
             confirm_close: false,
             allow_close: false,
-            sim: SimParams::default(),
+            fx_target: FxTarget::Input,
+            fx_last_sel: None,
             status: String::new(),
             px_per_sec: 60.0,
             follow: true,
@@ -281,12 +290,16 @@ impl App {
                 .collect()
         };
         let c1 = self.doc.make_clip(wave(12.0, 110.0, 0.6), 0);
-        self.doc.add_track("Rhythm".into(), Some(c1), true);
+        let rhythm = self.doc.add_track("Rhythm".into(), Some(c1), vec![]);
+        self.doc.add_fx(FxTarget::Track(rhythm), FxKind::Eq);
+        self.doc.add_fx(FxTarget::Track(rhythm), FxKind::Reverb);
         let c2 = self
             .doc
             .make_clip(wave(6.0, 220.0, 0.4), (3.0 * sr) as usize);
         let c2_id = c2.id;
-        let lead = self.doc.add_track("Lead".into(), Some(c2), false);
+        let lead = self.doc.add_track("Lead".into(), Some(c2), vec![]);
+        self.doc.add_fx(FxTarget::Track(lead), FxKind::Delay);
+        self.doc.add_fx(FxTarget::Master, FxKind::Limiter);
         self.doc.split(c2_id, (6.0 * sr) as usize);
         if let Some(t) = self.doc.track_mut(lead) {
             t.pan = 0.4;
@@ -429,7 +442,6 @@ impl App {
                 click_volume: e.click_volume,
                 latency_ms: e.latency_ms,
             },
-            ir_name: e.ir_name().to_string(),
             in_peak: e.in_peak,
             out_peak: e.out_peak,
         };
@@ -489,33 +501,17 @@ impl App {
             let clip = self.doc.make_clip(samples, start);
             let clip_id = clip.id;
             // What you heard while recording is what you get on playback.
-            let acoustic = self.sim.enabled;
+            let fx = self.input_fx_copy();
             self.doc
-                .add_track(format!("Take {}", self.take_counter), Some(clip), acoustic);
+                .add_track(format!("Take {}", self.take_counter), Some(clip), fx);
             self.sel = Some(Selection::Clip(clip_id));
         }
     }
 
-    fn set_ir(&mut self, path: Option<PathBuf>) {
-        let sr = self.engine.lock().sr;
-        let ir = match &path {
-            None => IrSpectrum::new("Built-in body", &builtin_body_ir(sr)),
-            Some(p) => match project::load_ir(p, sr as u32) {
-                Ok(ir) => IrSpectrum::new(
-                    p.file_stem()
-                        .map_or("IR".into(), |s| s.to_string_lossy().to_string()),
-                    &ir,
-                ),
-                Err(e) => {
-                    self.status = format!("Couldn't load IR: {e:#}");
-                    return;
-                }
-            },
-        };
-        self.sim.ir_path = path.map(|p| p.to_string_lossy().to_string());
-        let mut e = self.engine.lock();
-        e.set_ir(Arc::new(ir));
-        e.set_params(&self.sim);
+    /// A copy of the input effects for a new take (fresh ids).
+    fn input_fx_copy(&mut self) -> Vec<FxSlot> {
+        let fx = self.doc.input_fx.clone();
+        self.doc.copy_fx(&fx)
     }
 
     /// "Capture": turn the last minute of playing into a take, even if you never hit record.
@@ -567,11 +563,9 @@ impl App {
         self.take_counter += 1;
         let clip = self.doc.make_clip(samples, start);
         let id = clip.id;
-        self.doc.add_track(
-            format!("Capture {}", self.take_counter),
-            Some(clip),
-            self.sim.enabled,
-        );
+        let fx = self.input_fx_copy();
+        self.doc
+            .add_track(format!("Capture {}", self.take_counter), Some(clip), fx);
         self.sel = Some(Selection::Clip(id));
         self.status = format!(
             "Captured {:.0}s of what you just played (Ctrl+Z to undo)",
@@ -593,12 +587,12 @@ impl App {
         };
         self.autosave.last = Instant::now();
         self.autosave.saved_rev = self.doc.revision;
-        let tracks = self.doc.tracks.clone();
-        let (sim, sr, bpm) = (self.sim.clone(), snap.sr as u32, snap.knobs.bpm);
+        let song = self.doc.song();
+        let (sr, bpm) = (snap.sr as u32, snap.knobs.bpm);
         let (busy, written) = (self.autosave.busy.clone(), self.autosave.written.clone());
         *busy.lock() = true;
         std::thread::spawn(move || {
-            let r = project::save_incremental(&dir, sr, bpm, &sim, &tracks, &mut written.lock());
+            let r = project::save_incremental(&dir, sr, bpm, &song, &mut written.lock());
             if let Err(e) = r {
                 eprintln!("autosave failed: {e:#}");
             }
@@ -620,12 +614,10 @@ impl App {
                     let dir = project::autosave_dir().unwrap();
                     let sr = self.engine.lock().sr as u32;
                     match project::load(&dir, sr, &mut self.doc) {
-                        Ok((pf, tracks)) => {
-                            self.take_counter = tracks.len();
-                            self.doc.reset(tracks);
+                        Ok((pf, song)) => {
+                            self.take_counter = song.tracks.len();
+                            self.doc.reset(song);
                             self.engine.lock().bpm = pf.bpm;
-                            self.sim = pf.sim;
-                            self.set_ir(self.sim.ir_path.clone().map(PathBuf::from));
                             self.status = "Recovered your last session. Save it somewhere with File > Save project.".into();
                         }
                         Err(e) => self.status = format!("Couldn't recover: {e:#}"),
@@ -679,38 +671,47 @@ impl App {
         });
     }
 
-    fn save_sim_preset(&mut self) {
+    fn save_chain_preset(&mut self) {
+        let chain = self
+            .doc
+            .fx_chain(self.fx_target)
+            .cloned()
+            .unwrap_or_default();
         let Some(p) = rfd::FileDialog::new()
-            .add_filter("Unplugged preset", &["json"])
-            .set_file_name("my-acoustic.json")
+            .add_filter("Unplugged effect chain", &["json"])
+            .set_file_name("my-chain.json")
             .save_file()
         else {
             return;
         };
-        self.status = match serde_json::to_string_pretty(&self.sim).map(|j| std::fs::write(&p, j)) {
-            Ok(Ok(())) => format!("Saved preset {}", p.display()),
-            Ok(Err(e)) => format!("Couldn't save preset: {e}"),
-            Err(e) => format!("Couldn't save preset: {e}"),
+        self.status = match serde_json::to_string_pretty(&chain).map(|j| std::fs::write(&p, j)) {
+            Ok(Ok(())) => format!("Saved effect chain {}", p.display()),
+            Ok(Err(e)) => format!("Couldn't save: {e}"),
+            Err(e) => format!("Couldn't save: {e}"),
         };
     }
 
-    fn load_sim_preset(&mut self) {
+    fn load_chain_preset(&mut self) {
         let Some(p) = rfd::FileDialog::new()
-            .add_filter("Unplugged preset", &["json"])
+            .add_filter("Unplugged effect chain", &["json"])
             .pick_file()
         else {
             return;
         };
         match std::fs::read_to_string(&p)
             .map_err(anyhow::Error::from)
-            .and_then(|t| Ok(serde_json::from_str::<SimParams>(&t)?))
+            .and_then(|t| Ok(serde_json::from_str::<Vec<FxSlot>>(&t)?))
         {
-            Ok(sim) => {
-                self.sim = sim;
-                self.set_ir(self.sim.ir_path.clone().map(PathBuf::from));
-                self.status = format!("Loaded preset {}", p.display());
+            Ok(chain) => {
+                self.doc.checkpoint();
+                let chain = self.doc.copy_fx(&chain);
+                if let Some(c) = self.doc.fx_chain_mut(self.fx_target) {
+                    *c = chain;
+                }
+                self.doc.touch();
+                self.status = format!("Loaded effect chain {}", p.display());
             }
-            Err(e) => self.status = format!("Couldn't load preset: {e:#}"),
+            Err(e) => self.status = format!("Couldn't load effect chain: {e:#}"),
         }
     }
 
@@ -869,7 +870,7 @@ impl App {
 
     fn new_project(&mut self) {
         self.stop();
-        self.doc.reset(Vec::new());
+        self.doc.reset(Song::default());
         self.engine.lock().seek(0);
         self.sel = None;
         self.project_dir = None;
@@ -893,7 +894,7 @@ impl App {
             let e = self.engine.lock();
             (e.sr as u32, e.bpm)
         };
-        self.status = match project::save(&dir, sr, bpm, &self.sim, &self.doc.tracks) {
+        self.status = match project::save(&dir, sr, bpm, &self.doc.song()) {
             Ok(()) => {
                 self.saved_rev = self.doc.revision;
                 format!("Saved to {}", dir.display())
@@ -911,13 +912,11 @@ impl App {
         };
         let sr = self.engine.lock().sr as u32;
         match project::load(&dir, sr, &mut self.doc) {
-            Ok((pf, tracks)) => {
+            Ok((pf, song)) => {
                 self.new_project();
-                self.take_counter = tracks.len();
-                self.doc.reset(tracks);
+                self.take_counter = song.tracks.len();
+                self.doc.reset(song);
                 self.engine.lock().bpm = pf.bpm;
-                self.sim = pf.sim;
-                self.set_ir(self.sim.ir_path.clone().map(PathBuf::from));
                 self.status = format!("Opened {}", dir.display());
                 self.project_dir = Some(dir);
                 self.saved_rev = self.doc.revision;
@@ -943,7 +942,7 @@ impl App {
                     .file_stem()
                     .map_or("Import".into(), |s| s.to_string_lossy().to_string());
                 let clip = self.doc.make_clip(samples, at);
-                self.doc.add_track(name, Some(clip), false);
+                self.doc.add_track(name, Some(clip), vec![]);
                 self.status = format!("Imported {}", path.display());
             }
             Err(e) => self.status = format!("Import failed: {e:#}"),
@@ -968,16 +967,13 @@ impl App {
         else {
             return;
         };
-        let (ir, sr) = {
-            let e = self.engine.lock();
-            (e.ir(), e.sr)
-        };
+        let sr = self.engine.lock().sr;
         let tracks = self.doc.tracks.clone();
+        let master_fx = self.doc.master_fx.clone();
         if tracks.iter().all(|t| t.clips.is_empty()) {
             self.share.result = Some("Record something first.".into());
             return;
         }
-        let sim = self.sim.clone();
         let opts = self.share.opts.clone();
         let clip = self.share.clip.then_some((self.share.from, self.share.to));
         let job = self.share.job.clone();
@@ -985,7 +981,7 @@ impl App {
         self.share.result = None;
         std::thread::spawn(move || {
             let run = || -> anyhow::Result<String> {
-                let mut mix = render_mix(&tracks, &sim, ir, sr);
+                let mut mix = render_mix(&tracks, &master_fx, sr);
                 if let Some((from, to)) = clip {
                     let frames = mix.len() / 2;
                     let a = ((from * sr) as usize).min(frames);
@@ -1163,7 +1159,10 @@ impl App {
                             ("Ctrl+D", "Duplicate"),
                             ("Ctrl+Z", "Undo"),
                             ("Ctrl+Shift+Z / Ctrl+Y", "Redo"),
-                            ("← / →", "Nudge selected clip 10 ms (Shift: 1 ms)"),
+                            (
+                                "Left / Right arrow",
+                                "Nudge selected clip 10 ms (Shift: 1 ms)",
+                            ),
                             ("Alt while dragging", "Ignore snap"),
                             ("+ / − or Ctrl+wheel", "Zoom"),
                             ("Ctrl+S", "Save project"),
@@ -1320,7 +1319,7 @@ impl App {
         }
     }
 
-    fn side_panel(&mut self, ui: &mut egui::Ui, snap: &Snapshot, knobs: &mut Knobs) {
+    fn side_panel(&mut self, ui: &mut egui::Ui, knobs: &mut Knobs) {
         ui.heading("Input");
         ui.add(egui::Slider::new(&mut knobs.input_gain_db, -12.0..=24.0).text("Gain dB"))
             .on_hover_text(
@@ -1334,63 +1333,162 @@ impl App {
             );
 
         ui.separator();
-        ui.heading("Acoustic sim");
+        self.fx_panel(ui);
+    }
+
+    fn fx_panel(&mut self, ui: &mut egui::Ui) {
+        // Follow the selection: picking a clip or track shows that track's effects.
+        let sel_track = match self.sel {
+            Some(Selection::Track(t)) => Some(t),
+            Some(Selection::Clip(c)) => self.doc.find_clip(c).map(|(ti, _)| self.doc.tracks[ti].id),
+            None => None,
+        };
+        if self.sel != self.fx_last_sel {
+            self.fx_last_sel = self.sel;
+            if let Some(t) = sel_track {
+                self.fx_target = FxTarget::Track(t);
+            }
+        }
+        if self.doc.fx_chain(self.fx_target).is_none() {
+            self.fx_target = FxTarget::Input;
+        }
+
+        ui.heading("Effects");
+        ui.horizontal_wrapped(|ui| {
+            let shown = match self.fx_target {
+                FxTarget::Track(t) => Some(t),
+                _ => sel_track,
+            };
+            if let Some(t) = shown.and_then(|t| self.doc.track(t)) {
+                let (id, name) = (t.id, t.name.clone());
+                ui.selectable_value(&mut self.fx_target, FxTarget::Track(id), name)
+                    .on_hover_text("Effects on this track");
+            }
+            ui.selectable_value(&mut self.fx_target, FxTarget::Input, "Input").on_hover_text(
+                "What you hear live while you play (with 🎧 Monitor on). New takes start with a copy of these.",
+            );
+            ui.selectable_value(&mut self.fx_target, FxTarget::Master, "Master")
+                .on_hover_text("Effects on the whole mix");
+        });
+        ui.add_space(4.0);
+
+        let target = self.fx_target;
+        let Some(chain) = self.doc.fx_chain(target).cloned() else {
+            return;
+        };
+        let mut edited = chain.clone();
+        let mut undo_point = false;
+        let mut remove = None;
+        let mut shift: Option<(usize, isize)> = None;
+        if edited.is_empty() {
+            ui.label(RichText::new("No effects yet. Add one below.").weak());
+        }
+        ui.spacing_mut().slider_width = 110.0;
+        for (i, slot) in edited.iter_mut().enumerate() {
+            egui::Frame::group(ui.style())
+                .inner_margin(6.0)
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        if ui
+                            .checkbox(&mut slot.on, "")
+                            .on_hover_text("On / off")
+                            .changed()
+                        {
+                            undo_point = true;
+                        }
+                        let name = RichText::new(slot.kind.name()).strong();
+                        ui.label(if slot.on { name } else { name.weak() })
+                            .on_hover_text(slot.kind.about());
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.small_button("✖").on_hover_text("Remove").clicked() {
+                                remove = Some(i);
+                            }
+                            if ui.small_button("⏷").on_hover_text("Move down").clicked() {
+                                shift = Some((i, 1));
+                            }
+                            if ui.small_button("⏶").on_hover_text("Move up").clicked() {
+                                shift = Some((i, -1));
+                            }
+                        });
+                    });
+                    ui.add_enabled_ui(slot.on, |ui| {
+                        let mut vals = slot.values();
+                        for (j, d) in slot.kind.params().iter().enumerate() {
+                            let r = if d.switch {
+                                let mut b = vals[j] > 0.5;
+                                let r = ui.checkbox(&mut b, d.name);
+                                vals[j] = if b { 1.0 } else { 0.0 };
+                                r
+                            } else {
+                                let suffix = if d.unit.is_empty() {
+                                    String::new()
+                                } else {
+                                    format!(" {}", d.unit)
+                                };
+                                ui.add(
+                                    egui::Slider::new(&mut vals[j], d.min..=d.max)
+                                        .logarithmic(d.log)
+                                        .text(d.name)
+                                        .suffix(suffix),
+                                )
+                            };
+                            if r.drag_started() || (r.changed() && !r.dragged()) {
+                                undo_point = true;
+                            }
+                            if r.double_clicked() && !d.switch {
+                                vals[j] = d.default;
+                                undo_point = true;
+                            }
+                        }
+                        slot.params = vals;
+                    });
+                });
+        }
+        if let Some(i) = remove {
+            edited.remove(i);
+            undo_point = true;
+        }
+        if let Some((i, d)) = shift {
+            let j = (i as isize + d).clamp(0, edited.len() as isize - 1) as usize;
+            edited.swap(i, j);
+            undo_point = true;
+        }
+        if edited != chain {
+            if undo_point {
+                self.doc.checkpoint();
+            }
+            if let Some(c) = self.doc.fx_chain_mut(target) {
+                *c = edited;
+            }
+            self.doc.touch();
+        }
+
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.menu_button(RichText::new("➕ Add effect").strong(), |ui| {
+                for kind in FxKind::ALL {
+                    if ui.button(kind.name()).on_hover_text(kind.about()).clicked() {
+                        self.doc.add_fx(target, kind);
+                        ui.close();
+                    }
+                }
+            });
+            ui.menu_button("Chain…", |ui| {
+                if ui.button("Save chain as preset…").clicked() {
+                    self.save_chain_preset();
+                    ui.close();
+                }
+                if ui.button("Load preset into this chain…").clicked() {
+                    self.load_chain_preset();
+                    ui.close();
+                }
+            });
+        });
         ui.label(
-            RichText::new("Effect that makes an electric guitar sound acoustic. New takes play back with it when it's on.")
+            RichText::new("Double-click a knob to reset it.")
                 .small()
                 .weak(),
         );
-        ui.add_space(4.0);
-        let before = self.sim.clone();
-        ui.checkbox(&mut self.sim.enabled, "On");
-        ui.add_enabled_ui(self.sim.enabled, |ui| {
-            ui.checkbox(&mut self.sim.pickup_eq, "Pickup correction EQ")
-                .on_hover_text("Cuts the mid honk and pickup resonance of magnetic pickups");
-            ui.add(egui::Slider::new(&mut self.sim.body, 0.0..=1.0).text("Body"))
-                .on_hover_text("How much wooden guitar body you hear. 0 = plain electric, 1 = full acoustic body resonance.");
-            ui.add(egui::Slider::new(&mut self.sim.brightness_db, -6.0..=14.0).text("Sparkle dB"))
-                .on_hover_text("Treble shimmer / string zing. Electric pickups lose the airy top end an acoustic has; this adds it back.");
-            ui.add(egui::Slider::new(&mut self.sim.warmth_db, -6.0..=10.0).text("Warmth dB"))
-                .on_hover_text("Low 'boom' of the hollow body. Turn down if it sounds muddy or boomy.");
-            ui.add(egui::Slider::new(&mut self.sim.room, 0.0..=1.0).text("Room"))
-                .on_hover_text("Small-room echo, like playing in a bedroom instead of inside your headphones. 0 = dry.");
-            ui.add(egui::Slider::new(&mut self.sim.level_db, -18.0..=12.0).text("Level dB"))
-                .on_hover_text("Volume after the sim. Use it if the acoustic sound is louder or quieter than you want.");
-            ui.add_space(4.0);
-            ui.label(format!("Body IR: {}", snap.ir_name));
-            ui.horizontal(|ui| {
-                if ui
-                    .button("Load IR…")
-                    .on_hover_text("Any acoustic-sim impulse response .wav")
-                    .clicked()
-                    && let Some(p) = rfd::FileDialog::new()
-                        .add_filter("WAV", &["wav"])
-                        .pick_file()
-                {
-                    self.set_ir(Some(p));
-                }
-                if ui.button("Built-in").clicked() {
-                    self.set_ir(None);
-                }
-            });
-            ui.horizontal(|ui| {
-                if ui.button("Save preset…").clicked() {
-                    self.save_sim_preset();
-                }
-                if ui.button("Load preset…").clicked() {
-                    self.load_sim_preset();
-                }
-            });
-            if ui.button("Reset knobs").clicked() {
-                self.sim = SimParams {
-                    ir_path: self.sim.ir_path.clone(),
-                    ..SimParams::default()
-                };
-            }
-        });
-        if self.sim != before {
-            self.engine.lock().set_params(&self.sim);
-        }
     }
 
     fn transport(
@@ -1454,7 +1552,7 @@ impl App {
             ui.add_space(8.0);
             ui.separator();
             toggle(ui, &mut knobs.monitor, "🎧 Monitor").on_hover_text(
-                "Hear your guitar live through Unplugged (with the acoustic sim when it's on).\n\
+                "Hear your guitar live through Unplugged, through the Input effects.\n\
                  Turn this off if you use the Scarlett's Direct Monitor button, or you'll hear yourself twice.",
             );
             ui.separator();
@@ -1486,7 +1584,7 @@ impl App {
                 self.redo();
             }
             ui.separator();
-            ui.label("Master");
+            ui.label("Master vol");
             ui.add(egui::Slider::new(&mut knobs.master, 0.0..=1.5).show_value(false));
             ui.separator();
             toggle(ui, &mut self.follow, "Follow")
@@ -1607,6 +1705,7 @@ impl App {
         let mut v = t.clone();
         let mut delete = false;
         let mut toggled = false;
+        let mut open_fx = false;
         ui.spacing_mut().item_spacing = vec2(4.0, 6.0);
         ui.horizontal(|ui| {
             ui.add(egui::TextEdit::singleline(&mut v.name).desired_width(118.0));
@@ -1643,13 +1742,31 @@ impl App {
                 Color32::from_rgb(90, 200, 120),
                 "Solo",
             );
-            toggle(
-                ui,
-                &mut v.acoustic,
-                "A",
-                AMBER,
-                "Play this track through the acoustic sim",
-            );
+            let active = v.fx.iter().filter(|f| f.on).count();
+            let label = if active > 0 {
+                format!("FX {active}")
+            } else {
+                "FX".to_string()
+            };
+            let text = if active > 0 {
+                RichText::new(label).color(Color32::BLACK).strong()
+            } else {
+                RichText::new(label)
+            };
+            let fx_btn = egui::Button::new(text)
+                .min_size(vec2(24.0, 0.0))
+                .fill(if active > 0 {
+                    AMBER
+                } else {
+                    ui.visuals().widgets.inactive.bg_fill
+                });
+            if ui
+                .add(fx_btn)
+                .on_hover_text("Show this track's effects")
+                .clicked()
+            {
+                open_fx = true;
+            }
             if ui
                 .add(egui::Button::new("✖").min_size(vec2(24.0, 0.0)))
                 .on_hover_text("Delete track (or select it and press Delete)")
@@ -1682,13 +1799,17 @@ impl App {
             self.delete_selection();
             return;
         }
+        if open_fx {
+            self.sel = Some(Selection::Track(tid));
+            self.fx_last_sel = self.sel;
+            self.fx_target = FxTarget::Track(tid);
+        }
         let t = self.doc.track(tid).unwrap();
         let changed = v.name != t.name
             || v.volume != t.volume
             || v.pan != t.pan
             || v.mute != t.mute
-            || v.solo != t.solo
-            || v.acoustic != t.acoustic;
+            || v.solo != t.solo;
         if changed {
             if toggled {
                 self.doc.checkpoint();
@@ -2035,10 +2156,8 @@ impl App {
             let muted = t.mute || (any_solo && !t.solo);
             let col = if muted {
                 Color32::GRAY
-            } else if t.acoustic {
-                AMBER
             } else {
-                BLUE
+                TRACK_COLOURS[i % TRACK_COLOURS.len()]
             };
             for c in &t.clips {
                 let r = Rect::from_min_max(
@@ -2234,7 +2353,7 @@ impl eframe::App for App {
             .resizable(false)
             .exact_size(250.0)
             .show(ui, |ui| {
-                egui::ScrollArea::vertical().show(ui, |ui| self.side_panel(ui, &snap, &mut knobs));
+                egui::ScrollArea::vertical().show(ui, |ui| self.side_panel(ui, &mut knobs));
             });
         egui::CentralPanel::default().show(ui, |ui| self.timeline(ui, &snap, &mut actions));
 
@@ -2253,7 +2372,10 @@ impl eframe::App for App {
         }
         if self.doc.revision != self.synced_rev {
             self.synced_rev = self.doc.revision;
-            self.engine.lock().set_tracks(&self.doc.tracks);
+            let mut e = self.engine.lock();
+            e.set_tracks(&self.doc.tracks);
+            e.set_input_fx(&self.doc.input_fx);
+            e.set_master_fx(&self.doc.master_fx);
         }
         ctx.request_repaint_after(Duration::from_millis(33));
     }

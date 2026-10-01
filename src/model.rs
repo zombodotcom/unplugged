@@ -3,6 +3,7 @@
 //! Clips are cheap views into shared recorded audio (`source`), so split, duplicate,
 //! trim and undo never copy sample data.
 
+use crate::fx::{FxKind, FxSlot};
 use std::sync::Arc;
 
 /// Samples per waveform peak bucket.
@@ -56,8 +57,8 @@ pub struct Track {
     pub pan: f32,
     pub mute: bool,
     pub solo: bool,
-    /// Play back through the acoustic simulator.
-    pub acoustic: bool,
+    /// Effects, in order.
+    pub fx: Vec<FxSlot>,
     /// Flip polarity (phase), e.g. to line up two takes that cancel each other.
     pub invert: bool,
 }
@@ -87,12 +88,31 @@ pub enum Selection {
     Clip(u64),
 }
 
+/// Which effect chain.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FxTarget {
+    /// What you hear while playing and what new takes start with.
+    Input,
+    Master,
+    Track(u64),
+}
+
+/// Everything about the song that's saved and undoable.
+#[derive(Clone, Default)]
+pub struct Song {
+    pub tracks: Vec<Track>,
+    pub input_fx: Vec<FxSlot>,
+    pub master_fx: Vec<FxSlot>,
+}
+
 #[derive(Default)]
 pub struct Doc {
     pub tracks: Vec<Track>,
+    pub input_fx: Vec<FxSlot>,
+    pub master_fx: Vec<FxSlot>,
     next_id: u64,
-    undo: Vec<Vec<Track>>,
-    redo: Vec<Vec<Track>>,
+    undo: Vec<Song>,
+    redo: Vec<Song>,
     /// Bumped on every change so the engine knows to resync.
     pub revision: u64,
 }
@@ -110,9 +130,25 @@ impl Doc {
         self.next_id
     }
 
+    pub fn song(&self) -> Song {
+        Song {
+            tracks: self.tracks.clone(),
+            input_fx: self.input_fx.clone(),
+            master_fx: self.master_fx.clone(),
+        }
+    }
+
+    fn restore(&mut self, s: Song) -> Song {
+        let old = self.song();
+        self.tracks = s.tracks;
+        self.input_fx = s.input_fx;
+        self.master_fx = s.master_fx;
+        old
+    }
+
     /// Call before an edit so it can be undone.
     pub fn checkpoint(&mut self) {
-        self.undo.push(self.tracks.clone());
+        self.undo.push(self.song());
         if self.undo.len() > UNDO_LIMIT {
             self.undo.remove(0);
         }
@@ -136,7 +172,8 @@ impl Doc {
         let Some(prev) = self.undo.pop() else {
             return false;
         };
-        self.redo.push(std::mem::replace(&mut self.tracks, prev));
+        let cur = self.restore(prev);
+        self.redo.push(cur);
         self.touch();
         true
     }
@@ -145,18 +182,26 @@ impl Doc {
         let Some(next) = self.redo.pop() else {
             return false;
         };
-        self.undo.push(std::mem::replace(&mut self.tracks, next));
+        let cur = self.restore(next);
+        self.undo.push(cur);
         self.touch();
         true
     }
 
     /// Replace everything (new/open project). Clears history.
-    pub fn reset(&mut self, tracks: Vec<Track>) {
-        self.tracks = tracks;
+    pub fn reset(&mut self, song: Song) {
+        self.restore(song);
+        let fx_ids = self
+            .input_fx
+            .iter()
+            .chain(&self.master_fx)
+            .chain(self.tracks.iter().flat_map(|t| &t.fx))
+            .map(|f| f.id);
         let max = self
             .tracks
             .iter()
             .flat_map(|t| std::iter::once(t.id).chain(t.clips.iter().map(|c| c.id)))
+            .chain(fx_ids)
             .max()
             .unwrap_or(0);
         self.next_id = self.next_id.max(max);
@@ -204,8 +249,45 @@ impl Doc {
         }
     }
 
-    /// Adds a track holding one clip. Returns the track id.
-    pub fn add_track(&mut self, name: String, clip: Option<Clip>, acoustic: bool) -> u64 {
+    /// Copies of `fx` with fresh ids (for a new track or a duplicate).
+    pub fn copy_fx(&mut self, fx: &[FxSlot]) -> Vec<FxSlot> {
+        fx.iter()
+            .map(|f| FxSlot {
+                id: self.new_id(),
+                ..f.clone()
+            })
+            .collect()
+    }
+
+    pub fn fx_chain(&self, target: FxTarget) -> Option<&Vec<FxSlot>> {
+        match target {
+            FxTarget::Input => Some(&self.input_fx),
+            FxTarget::Master => Some(&self.master_fx),
+            FxTarget::Track(id) => self.track(id).map(|t| &t.fx),
+        }
+    }
+
+    pub fn fx_chain_mut(&mut self, target: FxTarget) -> Option<&mut Vec<FxSlot>> {
+        match target {
+            FxTarget::Input => Some(&mut self.input_fx),
+            FxTarget::Master => Some(&mut self.master_fx),
+            FxTarget::Track(id) => self.track_mut(id).map(|t| &mut t.fx),
+        }
+    }
+
+    /// Adds an effect to the end of a chain. Returns its id.
+    pub fn add_fx(&mut self, target: FxTarget, kind: FxKind) -> Option<u64> {
+        self.fx_chain(target)?;
+        self.checkpoint();
+        let slot = FxSlot::new(self.new_id(), kind);
+        let id = slot.id;
+        self.fx_chain_mut(target)?.push(slot);
+        self.touch();
+        Some(id)
+    }
+
+    /// Adds a track holding one clip, with effects `fx`. Returns the track id.
+    pub fn add_track(&mut self, name: String, clip: Option<Clip>, fx: Vec<FxSlot>) -> u64 {
         self.checkpoint();
         let id = self.new_id();
         self.tracks.push(Track {
@@ -216,7 +298,7 @@ impl Doc {
             pan: 0.0,
             mute: false,
             solo: false,
-            acoustic,
+            fx,
             invert: false,
         });
         self.touch();
@@ -269,6 +351,7 @@ impl Doc {
                 for c in &mut copy.clips {
                     c.id = self.new_id();
                 }
+                copy.fx = self.copy_fx(&copy.fx);
                 let new = copy.id;
                 self.tracks.insert(i + 1, copy);
                 self.touch();
@@ -392,7 +475,7 @@ mod tests {
         let mut d = Doc::new();
         let clip = d.make_clip((0..1000).map(|i| i as f32).collect(), 100);
         let cid = clip.id;
-        let tid = d.add_track("t".into(), Some(clip), false);
+        let tid = d.add_track("t".into(), Some(clip), vec![]);
         (d, tid, cid)
     }
 
@@ -458,9 +541,29 @@ mod tests {
     }
 
     #[test]
+    fn fx_edits_are_undoable() {
+        let (mut d, tid, _) = doc_with_clip();
+        d.add_fx(FxTarget::Track(tid), FxKind::Reverb).unwrap();
+        d.add_fx(FxTarget::Master, FxKind::Limiter).unwrap();
+        assert_eq!(d.track(tid).unwrap().fx.len(), 1);
+        d.undo();
+        assert!(d.master_fx.is_empty());
+        d.undo();
+        assert!(d.track(tid).unwrap().fx.is_empty());
+        d.redo();
+        let Some(Selection::Track(t2)) = d.duplicate(Selection::Track(tid)) else {
+            panic!()
+        };
+        assert_ne!(
+            d.track(t2).unwrap().fx[0].id,
+            d.track(tid).unwrap().fx[0].id
+        );
+    }
+
+    #[test]
     fn move_between_tracks() {
         let (mut d, t1, cid) = doc_with_clip();
-        let t2 = d.add_track("b".into(), None, false);
+        let t2 = d.add_track("b".into(), None, vec![]);
         d.move_clip(cid, 50, Some(t2));
         assert!(d.track(t1).unwrap().clips.is_empty());
         assert_eq!(d.track(t2).unwrap().clips[0].start, 50);
@@ -470,7 +573,7 @@ mod tests {
     fn split_all_at_playhead() {
         let (mut d, _, _) = doc_with_clip();
         let c2 = d.make_clip(vec![0.0; 1000], 0);
-        d.add_track("b".into(), Some(c2), false);
+        d.add_track("b".into(), Some(c2), vec![]);
         assert_eq!(d.split_all_at(500, None), 2);
         assert_eq!(d.tracks.iter().map(|t| t.clips.len()).sum::<usize>(), 4);
         d.undo(); // one undo step for the whole split

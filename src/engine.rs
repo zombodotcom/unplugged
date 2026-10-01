@@ -5,15 +5,14 @@
 //! and pushes a copy here with [`Engine::set_tracks`] whenever it changes; clips share
 //! their audio through `Arc`s, so that copy is cheap.
 
-use crate::dsp::{AcousticSim, IrSpectrum, SimParams, builtin_body_ir};
+use crate::fx::{Chain, FxSlot};
 use crate::model::Track;
 use std::collections::VecDeque;
 use std::f32::consts::PI;
-use std::sync::Arc;
 
 struct EngineTrack {
     data: Track,
-    sim: AcousticSim,
+    chain: Chain,
 }
 
 pub struct Engine {
@@ -38,9 +37,11 @@ pub struct Engine {
     /// Round-trip latency to compensate recordings by, in milliseconds.
     pub latency_ms: f32,
 
-    params: SimParams,
-    ir: Arc<IrSpectrum>,
-    monitor_sim: AcousticSim,
+    /// Effects you hear (and play) through live.
+    input_fx: Vec<FxSlot>,
+    input_chain: Chain,
+    master_fx: Vec<FxSlot>,
+    master_chain: Chain,
 
     /// The last [`CAPTURE_SECONDS`] of input, always recording (for "Capture").
     history: Vec<f32>,
@@ -54,8 +55,6 @@ pub struct Engine {
 
 impl Engine {
     pub fn new(sr: f32) -> Self {
-        let params = SimParams::default();
-        let ir = Arc::new(IrSpectrum::new("Built-in body", &builtin_body_ir(sr)));
         Self {
             sr,
             tracks: Vec::new(),
@@ -73,9 +72,10 @@ impl Engine {
             bpm: 90.0,
             click_volume: 0.4,
             latency_ms: 12.0,
-            monitor_sim: AcousticSim::new(sr, &params, ir.clone()),
-            params,
-            ir,
+            input_fx: Vec::new(),
+            input_chain: Chain::new(sr),
+            master_fx: Vec::new(),
+            master_chain: Chain::new(sr),
             history: vec![0.0; (CAPTURE_SECONDS * sr) as usize],
             hist_pos: 0,
             hist_len: 0,
@@ -86,29 +86,14 @@ impl Engine {
 
     // ---- settings --------------------------------------------------------
 
-    pub fn ir_name(&self) -> &str {
-        &self.ir.name
+    pub fn set_input_fx(&mut self, fx: &[FxSlot]) {
+        self.input_chain.sync(fx);
+        self.input_fx = fx.to_vec();
     }
 
-    pub fn set_params(&mut self, p: &SimParams) {
-        self.monitor_sim.set_params(p);
-        for t in &mut self.tracks {
-            t.sim.set_params(p);
-        }
-        self.params = p.clone();
-    }
-
-    /// Swap in a new IR for the monitor and every track.
-    pub fn set_ir(&mut self, ir: Arc<IrSpectrum>) {
-        self.monitor_sim.set_ir(ir.clone());
-        for t in &mut self.tracks {
-            t.sim.set_ir(ir.clone());
-        }
-        self.ir = ir;
-    }
-
-    pub fn ir(&self) -> Arc<IrSpectrum> {
-        self.ir.clone()
+    pub fn set_master_fx(&mut self, fx: &[FxSlot]) {
+        self.master_chain.sync(fx);
+        self.master_fx = fx.to_vec();
     }
 
     /// Called when the audio device (re)starts. Rebuilds processors if the rate changed.
@@ -117,12 +102,10 @@ impl Engine {
             return;
         }
         self.sr = sr;
-        if self.params.ir_path.is_none() {
-            self.ir = Arc::new(IrSpectrum::new("Built-in body", &builtin_body_ir(sr)));
-        }
-        self.monitor_sim = AcousticSim::new(sr, &self.params, self.ir.clone());
+        self.input_chain = Chain::from_slots(sr, &self.input_fx);
+        self.master_chain = Chain::from_slots(sr, &self.master_fx);
         for t in &mut self.tracks {
-            t.sim = AcousticSim::new(sr, &self.params, self.ir.clone());
+            t.chain = Chain::from_slots(sr, &t.data.fx);
         }
         self.history = vec![0.0; (CAPTURE_SECONDS * sr) as usize];
         self.hist_pos = 0;
@@ -143,19 +126,17 @@ impl Engine {
     pub fn set_tracks(&mut self, tracks: &[Track]) {
         let mut old: Vec<EngineTrack> = std::mem::take(&mut self.tracks);
         for t in tracks {
-            let sim = match old.iter().position(|o| o.data.id == t.id) {
+            let chain = match old.iter().position(|o| o.data.id == t.id) {
                 Some(i) => {
-                    let mut o = old.swap_remove(i);
-                    if o.data.acoustic != t.acoustic {
-                        o.sim.reset();
-                    }
-                    o.sim
+                    let mut c = old.swap_remove(i).chain;
+                    c.sync(&t.fx);
+                    c
                 }
-                None => AcousticSim::new(self.sr, &self.params, self.ir.clone()),
+                None => Chain::from_slots(self.sr, &t.fx),
             };
             self.tracks.push(EngineTrack {
                 data: t.clone(),
-                sim,
+                chain,
             });
         }
     }
@@ -231,8 +212,9 @@ impl Engine {
 
     fn reset_sims(&mut self) {
         for t in &mut self.tracks {
-            t.sim.reset();
+            t.chain.reset();
         }
+        self.master_chain.reset();
     }
 
     // ---- audio -----------------------------------------------------------
@@ -272,16 +254,16 @@ impl Engine {
             let mut l = 0.0;
             let mut r = 0.0;
             if self.monitor {
-                let m = self.monitor_sim.process(x);
-                l += m;
-                r += m;
+                let (mut ml, mut mr) = (x, x);
+                self.input_chain.process(&mut ml, &mut mr);
+                l += ml;
+                r += mr;
             }
 
+            let mut click = 0.0;
             if self.playing && self.count_in > 0 {
                 // Count-in: clicks only, the song waits.
-                let c = self.click(self.count_in_total - self.count_in);
-                l += c;
-                r += c;
+                click = self.click(self.count_in_total - self.count_in);
                 self.count_in -= 1;
             } else if self.playing {
                 if self.recording {
@@ -289,24 +271,25 @@ impl Engine {
                 }
                 let pos = self.playhead;
                 for t in &mut self.tracks {
-                    let audible = !t.data.mute && (!any_solo || t.data.solo);
                     let s = t.data.sample_at(pos);
                     let s = if t.data.invert { -s } else { s };
-                    // The sim keeps running between clips so its tail rings out.
-                    let s = if t.data.acoustic { t.sim.process(s) } else { s };
-                    if audible {
-                        let angle = (t.data.pan + 1.0) * PI / 4.0;
-                        l += s * t.data.volume * angle.cos();
-                        r += s * t.data.volume * angle.sin();
+                    // Effects keep running between clips so reverb and delay tails ring out.
+                    let (mut tl, mut tr) = (s, s);
+                    t.chain.process(&mut tl, &mut tr);
+                    if !t.data.mute && (!any_solo || t.data.solo) {
+                        let (gl, gr) = pan_gains(t.data.pan);
+                        l += tl * t.data.volume * gl;
+                        r += tr * t.data.volume * gr;
                     }
                 }
                 if self.metronome {
-                    let c = self.click(pos);
-                    l += c;
-                    r += c;
+                    click = self.click(pos);
                 }
                 self.playhead += 1;
             }
+            self.master_chain.process(&mut l, &mut r);
+            l += click;
+            r += click;
 
             let l = soft_clip(l * self.master);
             let r = soft_clip(r * self.master);
@@ -315,6 +298,12 @@ impl Engine {
             frame[1] = r;
         }
     }
+}
+
+/// Balance-style pan: centre leaves both sides at full level.
+#[inline]
+pub fn pan_gains(pan: f32) -> (f32, f32) {
+    ((1.0 - pan).min(1.0), (1.0 + pan).min(1.0))
 }
 
 #[inline]
@@ -330,30 +319,34 @@ fn soft_clip(x: f32) -> f32 {
 pub const CAPTURE_SECONDS: f32 = 60.0;
 
 /// Offline mixdown of the whole song to interleaved stereo.
-pub fn render_mix(tracks: &[Track], params: &SimParams, ir: Arc<IrSpectrum>, sr: f32) -> Vec<f32> {
-    let tail = (sr * 2.0) as usize;
+pub fn render_mix(tracks: &[Track], master_fx: &[FxSlot], sr: f32) -> Vec<f32> {
+    let tail = (sr * 4.0) as usize;
     let len = tracks.iter().map(Track::end).max().unwrap_or(0) + tail;
-    let lat = crate::dsp::CONV_BLOCK;
     let any_solo = tracks.iter().any(|t| t.solo);
     let mut mix = vec![0.0f32; len * 2];
     for t in tracks.iter().filter(|t| !t.mute && (!any_solo || t.solo)) {
-        let angle = (t.pan + 1.0) * PI / 4.0;
-        let (gl, gr) = (t.volume * angle.cos(), t.volume * angle.sin());
-        let wet = t.acoustic && params.enabled;
-        let mut sim = AcousticSim::new(sr, params, ir.clone());
-        let first = t.start();
+        let (gl, gr) = pan_gains(t.pan);
+        let (gl, gr) = (gl * t.volume, gr * t.volume);
         let sign = if t.invert { -1.0 } else { 1.0 };
-        for pos in first..len + if wet { lat } else { 0 } {
+        let mut chain = Chain::from_slots(sr, &t.fx);
+        // Line up effects that add delay (e.g. the acoustic sim's convolution).
+        let lat = chain.latency();
+        let first = t.start();
+        for pos in first..len + lat {
             let s = t.sample_at(pos) * sign;
-            let (y, at) = if wet {
-                (sim.process(s), pos.checked_sub(lat))
-            } else {
-                (s, Some(pos))
-            };
-            if let Some(at) = at.filter(|&a| a < len && a >= first) {
-                mix[at * 2] += y * gl;
-                mix[at * 2 + 1] += y * gr;
+            let (mut l, mut r) = (s, s);
+            chain.process(&mut l, &mut r);
+            if let Some(at) = pos.checked_sub(lat).filter(|&a| a < len && a >= first) {
+                mix[at * 2] += l * gl;
+                mix[at * 2 + 1] += r * gr;
             }
+        }
+    }
+    let mut master = Chain::from_slots(sr, master_fx);
+    if !master.is_empty() {
+        for f in mix.chunks_exact_mut(2) {
+            let (a, b) = f.split_at_mut(1);
+            master.process(&mut a[0], &mut b[0]);
         }
     }
     // Trim silent tail.
@@ -445,14 +438,14 @@ mod tests {
         e.master = 1.0;
         let mut d = Doc::new();
         let clip = d.make_clip(vec![0.5f32; 100], 10);
-        let tid = d.add_track("t".into(), Some(clip), false);
+        let tid = d.add_track("t".into(), Some(clip), vec![]);
         d.track_mut(tid).unwrap().volume = 1.0;
         e.set_tracks(&d.tracks);
         e.play();
         let mut out = vec![0.0; 400];
         e.render(&mut VecDeque::new(), &mut out);
         assert_eq!(out[0], 0.0);
-        assert!((out[20] - 0.5 * (PI / 4.0).cos()).abs() < 1e-5);
+        assert!((out[20] - 0.5).abs() < 1e-5);
     }
 
     #[test]
@@ -460,14 +453,9 @@ mod tests {
         let mut d = Doc::new();
         let clip = d.make_clip(vec![0.25f32; 4800], 0);
         let id = clip.id;
-        d.add_track("t".into(), Some(clip), false);
+        d.add_track("t".into(), Some(clip), vec![]);
         d.trim_end(id, 2400);
-        let mix = render_mix(
-            &d.tracks,
-            &SimParams::default(),
-            Arc::new(IrSpectrum::new("x", &[1.0])),
-            48000.0,
-        );
+        let mix = render_mix(&d.tracks, &[], 48000.0);
         assert_eq!(mix.len(), 2400 * 2);
     }
 }

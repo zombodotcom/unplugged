@@ -109,6 +109,34 @@ impl Biquad {
         )
     }
 
+    pub fn lowpass(sr: f32, f: f32, q: f32) -> Self {
+        let (c, s) = Self::w0(sr, f);
+        let alpha = s / (2.0 * q);
+        Self::norm(
+            (1.0 - c) / 2.0,
+            1.0 - c,
+            (1.0 - c) / 2.0,
+            1.0 + alpha,
+            -2.0 * c,
+            1.0 - alpha,
+        )
+    }
+
+    pub fn low_shelf(sr: f32, f: f32, db: f32) -> Self {
+        let a = 10f32.powf(db / 40.0);
+        let (c, s) = Self::w0(sr, f);
+        let alpha = s / 2.0 * 2f32.sqrt();
+        let sa = 2.0 * a.sqrt() * alpha;
+        Self::norm(
+            a * ((a + 1.0) - (a - 1.0) * c + sa),
+            2.0 * a * ((a - 1.0) - (a + 1.0) * c),
+            a * ((a + 1.0) - (a - 1.0) * c - sa),
+            (a + 1.0) + (a - 1.0) * c + sa,
+            -2.0 * ((a - 1.0) + (a + 1.0) * c),
+            (a + 1.0) + (a - 1.0) * c - sa,
+        )
+    }
+
     /// Take new coefficients but keep the filter state (no clicks on knob moves).
     pub fn retune(&mut self, other: Biquad) {
         let (z1, z2) = (self.z1, self.z2);

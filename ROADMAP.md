@@ -48,6 +48,13 @@ Simple features users have asked DAW makers for over years, often with hundreds 
 | Mute part of a clip / join two clips | Audacity | 2023 | GitHub [#5064](https://github.com/audacity/audacity/issues/5064), [#5509](https://github.com/audacity/audacity/issues/5509) | planned (join = "heal split") |
 | Several projects open at once (tabs) | Pro Tools, FL Studio | ~2009 | IdeaScale #6 ([Production Expert 2026](https://www.production-expert.com/production-expert-1/3-pro-tools-features-still-missing-in-2026)) | later |
 
+## Phase 1.5: Effects ✅ (v0.4)
+
+- ✅ Effect chains per track, Input and Master; EQ, Compressor, Gate, Limiter, Drive, Chorus, Delay, Reverb, Utility, Acoustic sim
+- ✅ Chain presets, undoable edits
+- Next: **load VST3/CLAP plugins**. Rust hosting crates now exist: [clack](https://github.com/prokopyl/clack) for CLAP and [plugin_host](https://lib.rs/crates/plugin_host) for VST3 + CLAP. The work is showing plugin windows and keeping a crashing plugin from taking the app down. **L**
+- Next: automation lanes (volume/pan/effect knobs over time), sends to a shared reverb bus, a live LUFS meter. **M each**
+
 ## Phase 2: Share exporter (the big one)
 
 Goal: one **Share** button that produces a correctly formatted file for each platform, plus a **standalone open-source CLI/library** that any DAW's users can run (Audacity, Reaper, anything that exports a WAV).

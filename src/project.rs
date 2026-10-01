@@ -5,14 +5,15 @@
 //! and duplicates don't copy audio on disk either.
 
 use crate::dsp::{MAX_IR_SECONDS, SimParams, normalize_energy};
-use crate::model::{Clip, Doc, Track, compute_peaks};
+use crate::fx::{FxKind, FxSlot};
+use crate::model::{Clip, Doc, Song, Track, compute_peaks};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
-pub const FORMAT_VERSION: u32 = 2;
+pub const FORMAT_VERSION: u32 = 3;
 
 #[derive(Serialize, Deserialize)]
 pub struct ProjectFile {
@@ -20,8 +21,14 @@ pub struct ProjectFile {
     pub version: u32,
     pub sample_rate: u32,
     pub bpm: f32,
-    pub sim: SimParams,
     pub tracks: Vec<TrackEntry>,
+    #[serde(default)]
+    pub input_fx: Vec<FxSlot>,
+    #[serde(default)]
+    pub master_fx: Vec<FxSlot>,
+    /// v1/v2 projects: acoustic-sim settings shared by "acoustic" tracks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sim: Option<SimParams>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -31,9 +38,13 @@ pub struct TrackEntry {
     pub pan: f32,
     pub mute: bool,
     pub solo: bool,
-    pub acoustic: bool,
+    #[serde(default)]
+    pub fx: Vec<FxSlot>,
     #[serde(default)]
     pub invert: bool,
+    /// v1/v2 projects: play through the acoustic sim.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub acoustic: bool,
     #[serde(default)]
     pub clips: Vec<ClipEntry>,
     /// v1 projects: one file per track.
@@ -68,15 +79,8 @@ impl WrittenAudio {
     }
 }
 
-pub fn save(dir: &Path, sr: u32, bpm: f32, sim: &SimParams, tracks: &[Track]) -> Result<()> {
-    save_incremental(
-        dir,
-        sr,
-        bpm,
-        sim,
-        tracks,
-        &mut WrittenAudio::with_prefix("source"),
-    )
+pub fn save(dir: &Path, sr: u32, bpm: f32, song: &Song) -> Result<()> {
+    save_incremental(dir, sr, bpm, song, &mut WrittenAudio::with_prefix("source"))
 }
 
 /// Like [`save`] but skips audio already in `written` (used by autosave).
@@ -84,10 +88,10 @@ pub fn save_incremental(
     dir: &Path,
     sr: u32,
     bpm: f32,
-    sim: &SimParams,
-    tracks: &[Track],
+    song: &Song,
     written: &mut WrittenAudio,
 ) -> Result<()> {
+    let tracks = &song.tracks;
     let audio = dir.join("audio");
     std::fs::create_dir_all(&audio)?;
     // One file per distinct recording, however many clips use it.
@@ -118,8 +122,9 @@ pub fn save_incremental(
             pan: t.pan,
             mute: t.mute,
             solo: t.solo,
-            acoustic: t.acoustic,
+            fx: t.fx.clone(),
             invert: t.invert,
+            acoustic: false,
             clips,
             file: None,
             start: None,
@@ -129,8 +134,10 @@ pub fn save_incremental(
         version: FORMAT_VERSION,
         sample_rate: sr,
         bpm,
-        sim: sim.clone(),
         tracks: entries,
+        input_fx: song.input_fx.clone(),
+        master_fx: song.master_fx.clone(),
+        sim: None,
     };
     // Write then rename, so a crash mid-save never leaves a half-written project.json.
     let tmp = dir.join("project.json.tmp");
@@ -159,8 +166,8 @@ pub fn clear_autosave() {
     }
 }
 
-/// Loads a project (v1 or v2), resampling audio to `sr` if needed. Ids come from `doc`.
-pub fn load(dir: &Path, sr: u32, doc: &mut Doc) -> Result<(ProjectFile, Vec<Track>)> {
+/// Loads a project (any version), resampling audio to `sr` if needed. Ids come from `doc`.
+pub fn load(dir: &Path, sr: u32, doc: &mut Doc) -> Result<(ProjectFile, Song)> {
     let text = std::fs::read_to_string(dir.join("project.json"))
         .context("no project.json in that folder")?;
     let pf: ProjectFile = serde_json::from_str(&text)?;
@@ -221,6 +228,10 @@ pub fn load(dir: &Path, sr: u32, doc: &mut Doc) -> Result<(ProjectFile, Vec<Trac
                 len,
             });
         }
+        let mut fx = doc.copy_fx(&e.fx);
+        if e.acoustic && fx.is_empty() {
+            fx.push(legacy_acoustic(doc.new_id(), pf.sim.as_ref()));
+        }
         tracks.push(Track {
             id: doc.new_id(),
             name: e.name.clone(),
@@ -229,11 +240,36 @@ pub fn load(dir: &Path, sr: u32, doc: &mut Doc) -> Result<(ProjectFile, Vec<Trac
             pan: e.pan,
             mute: e.mute,
             solo: e.solo,
-            acoustic: e.acoustic,
+            fx,
             invert: e.invert,
         });
     }
-    Ok((pf, tracks))
+    let input_fx = doc.copy_fx(&pf.input_fx);
+    let master_fx = doc.copy_fx(&pf.master_fx);
+    Ok((
+        pf,
+        Song {
+            tracks,
+            input_fx,
+            master_fx,
+        },
+    ))
+}
+
+/// Older projects had one shared acoustic sim; turn it into an effect slot.
+fn legacy_acoustic(id: u64, sim: Option<&SimParams>) -> FxSlot {
+    let mut slot = FxSlot::new(id, FxKind::Acoustic);
+    if let Some(s) = sim {
+        slot.params = vec![
+            s.body,
+            s.brightness_db,
+            s.warmth_db,
+            s.room,
+            if s.pickup_eq { 1.0 } else { 0.0 },
+        ];
+        slot.on = s.enabled;
+    }
+    slot
 }
 
 pub fn write_wav(path: &Path, samples: &[f32], channels: u16, sr: u32) -> Result<()> {
@@ -343,19 +379,26 @@ mod tests {
         let mut d = Doc::new();
         let clip = d.make_clip((0..1000).map(|i| i as f32 / 1000.0).collect(), 480);
         let cid = clip.id;
-        let tid = d.add_track("Rhythm".into(), Some(clip), true);
+        let tid = d.add_track("Rhythm".into(), Some(clip), vec![]);
         d.track_mut(tid).unwrap().solo = true;
+        d.add_fx(crate::model::FxTarget::Track(tid), FxKind::Reverb);
+        d.add_fx(crate::model::FxTarget::Master, FxKind::Limiter);
+        d.track_mut(tid).unwrap().fx[0].params[2] = 0.7;
         let right = d.split(cid, 980).unwrap();
         d.duplicate(crate::model::Selection::Clip(right));
-        save(&dir, 48000, 100.0, &SimParams::default(), &d.tracks).unwrap();
+        save(&dir, 48000, 100.0, &d.song()).unwrap();
         // Split + duplicate share one recording, so only one audio file is written.
         assert_eq!(std::fs::read_dir(dir.join("audio")).unwrap().count(), 1);
 
         let mut d2 = Doc::new();
-        let (pf, tracks) = load(&dir, 48000, &mut d2).unwrap();
+        let (pf, song) = load(&dir, 48000, &mut d2).unwrap();
+        let tracks = &song.tracks;
         assert_eq!(pf.bpm, 100.0);
         assert_eq!(tracks[0].name, "Rhythm");
-        assert!(tracks[0].solo && tracks[0].acoustic);
+        assert!(tracks[0].solo);
+        assert_eq!(tracks[0].fx[0].kind, FxKind::Reverb);
+        assert_eq!(tracks[0].fx[0].params[2], 0.7);
+        assert_eq!(song.master_fx[0].kind, FxKind::Limiter);
         assert!(!tracks[0].invert);
         assert_eq!(tracks[0].clips.len(), 3);
         for pos in [480, 979, 980, 1479, 1480, 1979] {
@@ -373,17 +416,17 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("unplugged-inc-{}", std::process::id()));
         let mut d = Doc::new();
         let c = d.make_clip(vec![0.1; 500], 0);
-        d.add_track("a".into(), Some(c), false);
+        d.add_track("a".into(), Some(c), vec![]);
         let mut w = WrittenAudio::with_prefix("auto");
-        save_incremental(&dir, 48000, 90.0, &SimParams::default(), &d.tracks, &mut w).unwrap();
+        save_incremental(&dir, 48000, 90.0, &d.song(), &mut w).unwrap();
         let first = std::fs::metadata(dir.join("audio/auto001.wav"))
             .unwrap()
             .modified()
             .unwrap();
         let c2 = d.make_clip(vec![0.2; 500], 600);
-        d.add_track("b".into(), Some(c2), false);
+        d.add_track("b".into(), Some(c2), vec![]);
         std::thread::sleep(std::time::Duration::from_millis(20));
-        save_incremental(&dir, 48000, 90.0, &SimParams::default(), &d.tracks, &mut w).unwrap();
+        save_incremental(&dir, 48000, 90.0, &d.song(), &mut w).unwrap();
         assert_eq!(
             std::fs::metadata(dir.join("audio/auto001.wav"))
                 .unwrap()
@@ -392,8 +435,8 @@ mod tests {
             first
         );
         assert!(dir.join("audio/auto002.wav").is_file());
-        let (_, tracks) = load(&dir, 48000, &mut Doc::new()).unwrap();
-        assert_eq!(tracks.len(), 2);
+        let (_, song) = load(&dir, 48000, &mut Doc::new()).unwrap();
+        assert_eq!(song.tracks.len(), 2);
         std::fs::remove_dir_all(dir).ok();
     }
 
@@ -404,10 +447,14 @@ mod tests {
         write_wav(&dir.join("track01.wav"), &[0.5; 100], 1, 48000).unwrap();
         std::fs::write(
             dir.join("project.json"),
-            r#"{"sample_rate":48000,"bpm":90,"sim":{},"tracks":[{"name":"Take 1","file":"track01.wav","start":10,"volume":0.8,"pan":0,"mute":false,"solo":false,"acoustic":true}]}"#,
+            r#"{"sample_rate":48000,"bpm":90,"sim":{"body":0.5},"tracks":[{"name":"Take 1","file":"track01.wav","start":10,"volume":0.8,"pan":0,"mute":false,"solo":false,"acoustic":true}]}"#,
         )
         .unwrap();
-        let (_, tracks) = load(&dir, 48000, &mut Doc::new()).unwrap();
+        let (_, song) = load(&dir, 48000, &mut Doc::new()).unwrap();
+        let tracks = &song.tracks;
+        // The old shared acoustic sim becomes an effect on that track.
+        assert_eq!(tracks[0].fx[0].kind, FxKind::Acoustic);
+        assert_eq!(tracks[0].fx[0].params[0], 0.5);
         assert_eq!(tracks[0].clips.len(), 1);
         assert_eq!(
             (tracks[0].clips[0].start, tracks[0].clips[0].len),
