@@ -97,12 +97,21 @@ pub enum FxTarget {
     Track(u64),
 }
 
+/// A named spot on the timeline (verse, chorus, "good take starts here"...).
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Marker {
+    pub id: u64,
+    pub pos: usize,
+    pub name: String,
+}
+
 /// Everything about the song that's saved and undoable.
 #[derive(Clone, Default)]
 pub struct Song {
     pub tracks: Vec<Track>,
     pub input_fx: Vec<FxSlot>,
     pub master_fx: Vec<FxSlot>,
+    pub markers: Vec<Marker>,
 }
 
 #[derive(Default)]
@@ -110,6 +119,8 @@ pub struct Doc {
     pub tracks: Vec<Track>,
     pub input_fx: Vec<FxSlot>,
     pub master_fx: Vec<FxSlot>,
+    /// Sorted by position.
+    pub markers: Vec<Marker>,
     next_id: u64,
     undo: Vec<Song>,
     redo: Vec<Song>,
@@ -135,6 +146,7 @@ impl Doc {
             tracks: self.tracks.clone(),
             input_fx: self.input_fx.clone(),
             master_fx: self.master_fx.clone(),
+            markers: self.markers.clone(),
         }
     }
 
@@ -143,6 +155,7 @@ impl Doc {
         self.tracks = s.tracks;
         self.input_fx = s.input_fx;
         self.master_fx = s.master_fx;
+        self.markers = s.markers;
         old
     }
 
@@ -196,7 +209,8 @@ impl Doc {
             .iter()
             .chain(&self.master_fx)
             .chain(self.tracks.iter().flat_map(|t| &t.fx))
-            .map(|f| f.id);
+            .map(|f| f.id)
+            .chain(self.markers.iter().map(|m| m.id));
         let max = self
             .tracks
             .iter()
@@ -468,6 +482,102 @@ impl Doc {
         self.touch();
     }
 
+    /// Joins a clip with the next clip on its track into one clip (undoes a split).
+    /// Returns the joined clip's id.
+    pub fn join_with_next(&mut self, id: u64) -> Option<u64> {
+        let (t, a) = self.find_clip(id)?;
+        let track = &self.tracks[t];
+        let first = &track.clips[a];
+        let b = track
+            .clips
+            .iter()
+            .enumerate()
+            .filter(|(i, c)| *i != a && c.start >= first.start)
+            .min_by_key(|(_, c)| c.start)
+            .map(|(i, _)| i)?;
+        self.checkpoint();
+        let (ca, cb) = (
+            self.tracks[t].clips[a].clone(),
+            self.tracks[t].clips[b].clone(),
+        );
+        let seamless = Arc::ptr_eq(&ca.source, &cb.source)
+            && cb.start == ca.end()
+            && cb.offset == ca.offset + ca.len;
+        let joined = if seamless {
+            Clip {
+                len: ca.len + cb.len,
+                ..ca
+            }
+        } else {
+            // Different recordings (or a gap): render the two into one new piece of audio.
+            // Where they overlap, the one played on top wins.
+            let (top, under) = if b > a { (&cb, &ca) } else { (&ca, &cb) };
+            let end = ca.end().max(cb.end());
+            let samples: Vec<f32> = (ca.start..end)
+                .map(|p| {
+                    top.sample_at(p)
+                        .or_else(|| under.sample_at(p))
+                        .unwrap_or(0.0)
+                })
+                .collect();
+            let mut c = self.make_clip(samples, ca.start);
+            c.id = ca.id;
+            c
+        };
+        let clips = &mut self.tracks[t].clips;
+        clips[a] = joined;
+        clips.remove(b);
+        self.touch();
+        Some(id)
+    }
+
+    /// Adds a marker at `pos` (unless there's one right there). Returns its id.
+    pub fn add_marker(&mut self, pos: usize, near: usize) -> Option<u64> {
+        if self.markers.iter().any(|m| m.pos.abs_diff(pos) <= near) {
+            return None;
+        }
+        self.checkpoint();
+        let id = self.new_id();
+        let name = format!("Marker {}", self.markers.len() + 1);
+        self.markers.push(Marker { id, pos, name });
+        self.markers.sort_by_key(|m| m.pos);
+        self.touch();
+        Some(id)
+    }
+
+    pub fn rename_marker(&mut self, id: u64, name: String) {
+        if self.markers.iter().any(|m| m.id == id && m.name != name) {
+            self.checkpoint();
+            if let Some(m) = self.markers.iter_mut().find(|m| m.id == id) {
+                m.name = name;
+            }
+            self.touch();
+        }
+    }
+
+    pub fn delete_marker(&mut self, id: u64) {
+        if self.markers.iter().any(|m| m.id == id) {
+            self.checkpoint();
+            self.markers.retain(|m| m.id != id);
+            self.touch();
+        }
+    }
+
+    /// The next marker strictly after `pos`.
+    pub fn next_marker(&self, pos: usize) -> Option<usize> {
+        self.markers.iter().map(|m| m.pos).find(|&p| p > pos)
+    }
+
+    /// The previous marker strictly before `pos` (with a little slack so pressing it
+    /// twice while playing keeps going back).
+    pub fn prev_marker(&self, pos: usize, slack: usize) -> Option<usize> {
+        self.markers
+            .iter()
+            .rev()
+            .map(|m| m.pos)
+            .find(|&p| p + slack < pos)
+    }
+
     pub fn move_track(&mut self, id: u64, delta: isize) {
         let Some(i) = self.tracks.iter().position(|t| t.id == id) else {
             return;
@@ -573,6 +683,65 @@ mod tests {
             d.track(t2).unwrap().fx[0].id,
             d.track(tid).unwrap().fx[0].id
         );
+    }
+
+    #[test]
+    fn join_heals_a_split() {
+        let (mut d, tid, cid) = doc_with_clip();
+        let right = d.split(cid, 600).unwrap();
+        assert_eq!(d.join_with_next(cid), Some(cid));
+        let t = d.track(tid).unwrap();
+        assert_eq!(t.clips.len(), 1);
+        assert_eq!(
+            (t.clips[0].start, t.clips[0].len, t.clips[0].offset),
+            (100, 1000, 0)
+        );
+        assert!(
+            Arc::ptr_eq(&t.clips[0].source, &t.clips[0].source),
+            "no new audio for a clean join"
+        );
+        assert!(d.find_clip(right).is_none());
+        d.undo();
+        assert_eq!(d.track(tid).unwrap().clips.len(), 2);
+    }
+
+    #[test]
+    fn join_renders_different_recordings_with_a_gap() {
+        let (mut d, tid, cid) = doc_with_clip(); // 100..1100, values 0..1000
+        let other = d.make_clip(vec![-1.0; 100], 1200);
+        d.tracks[0].clips.push(other);
+        d.join_with_next(cid).unwrap();
+        let t = d.track(tid).unwrap();
+        assert_eq!(t.clips.len(), 1);
+        assert_eq!((t.clips[0].start, t.clips[0].end()), (100, 1300));
+        assert_eq!(t.sample_at(500), 400.0);
+        assert_eq!(t.sample_at(1150), 0.0, "the gap is silence");
+        assert_eq!(t.sample_at(1250), -1.0);
+    }
+
+    #[test]
+    fn markers_add_jump_rename_delete_undo() {
+        let mut d = Doc::new();
+        let a = d.add_marker(4800, 100).unwrap();
+        assert!(
+            d.add_marker(4850, 100).is_none(),
+            "no duplicates right next to each other"
+        );
+        d.add_marker(1000, 100).unwrap();
+        assert_eq!(
+            d.markers.iter().map(|m| m.pos).collect::<Vec<_>>(),
+            [1000, 4800],
+            "kept sorted"
+        );
+        assert_eq!(d.next_marker(1000), Some(4800));
+        assert_eq!(d.prev_marker(4800, 0), Some(1000));
+        assert_eq!(d.prev_marker(1000, 0), None);
+        d.rename_marker(a, "Chorus".into());
+        assert_eq!(d.markers[1].name, "Chorus");
+        d.delete_marker(a);
+        assert_eq!(d.markers.len(), 1);
+        d.undo();
+        assert_eq!(d.markers[1].name, "Chorus");
     }
 
     #[test]

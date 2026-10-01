@@ -82,6 +82,11 @@ pub struct Engine {
     pub out_peak: f32,
 
     scratch: Scratch,
+
+    /// The last second of output (interleaved stereo), for the loudness meter.
+    out_hist: Vec<f32>,
+    /// Total frames ever written to `out_hist`.
+    out_frames: u64,
 }
 
 impl Engine {
@@ -113,6 +118,8 @@ impl Engine {
             in_peak: 0.0,
             out_peak: 0.0,
             scratch: Scratch::new(),
+            out_hist: vec![0.0; (sr as usize).max(1) * 2],
+            out_frames: 0,
         }
     }
 
@@ -141,6 +148,8 @@ impl Engine {
             t.chain = Chain::from_slots(sr, &t.data.fx);
         }
         self.history = vec![0.0; (CAPTURE_SECONDS * sr) as usize];
+        self.out_hist = vec![0.0; (sr as usize).max(1) * 2];
+        self.out_frames = 0;
         self.hist_pos = 0;
         self.hist_len = 0;
     }
@@ -226,6 +235,18 @@ impl Engine {
 
     pub fn recording_start(&self) -> usize {
         self.rec_start
+    }
+
+    /// Appends output frames written since frame `from` (at most the last second) to `out`
+    /// as interleaved stereo. Returns the new frame count to pass next time.
+    pub fn output_since(&self, from: u64, out: &mut Vec<f32>) -> u64 {
+        let cap = (self.out_hist.len() / 2) as u64;
+        let start = from.max(self.out_frames.saturating_sub(cap));
+        for f in start..self.out_frames {
+            let at = (f % cap) as usize * 2;
+            out.extend_from_slice(&self.out_hist[at..at + 2]);
+        }
+        self.out_frames
     }
 
     /// Copies recorded samples from index `from` onwards into `out` (for live waveforms).
@@ -375,6 +396,10 @@ impl Engine {
             self.out_peak = self.out_peak.max(l.abs()).max(r.abs());
             frame[0] = l;
             frame[1] = r;
+            let at = (self.out_frames as usize % (self.out_hist.len() / 2)) * 2;
+            self.out_hist[at] = l;
+            self.out_hist[at + 1] = r;
+            self.out_frames += 1;
         }
         self.scratch = sc;
     }
@@ -533,6 +558,22 @@ mod tests {
         assert_eq!(c[0], 68000.0);
         assert_eq!(*c.last().unwrap(), 69999.0);
         assert_eq!(e.captured(100.0).len(), 60000);
+    }
+
+    #[test]
+    fn output_history_for_meters() {
+        let mut e = Engine::new(1000.0); // 1 s history = 1000 frames
+        e.monitor = true;
+        let mut input: VecDeque<f32> = (0..1500).map(|_| 0.25).collect();
+        let mut out = vec![0.0; 3000];
+        e.render(&mut input, &mut out);
+        let mut got = Vec::new();
+        let next = e.output_since(0, &mut got);
+        assert_eq!(next, 1500);
+        assert_eq!(got.len(), 2000, "only the last second is kept");
+        let mut more = Vec::new();
+        assert_eq!(e.output_since(next, &mut more), 1500);
+        assert!(more.is_empty());
     }
 
     #[test]

@@ -1,11 +1,12 @@
 use crate::audio::{self, DeviceInfo, ErrorSlot, InputQueue, RunningAudio};
 use crate::engine::{CAPTURE_SECONDS, Engine, render_mix};
 use crate::fx::{FxKind, FxSlot};
-use crate::model::{Doc, FxTarget, PEAK_BUCKET, Selection, Song};
+use crate::model::{Doc, FxTarget, PEAK_BUCKET, Selection, Song, Track};
 use crate::plugins::{self, InstalledPlugin, PluginHost, PluginRef, catalog};
 use crate::project;
 use crate::share::{self, PRESETS, ShareOptions};
 use cpal::HostId;
+use ebur128::{EbuR128, Mode};
 use egui::{
     Align2, Color32, CursorIcon, FontId, Key, Pos2, Rect, RichText, Sense, Stroke, UiBuilder, pos2,
     vec2,
@@ -36,12 +37,22 @@ const TRACK_COLOURS: [Color32; 6] = [
 ];
 
 /// State of the Share window.
+/// What the Share window exports.
+#[derive(Clone, Copy, Default, PartialEq)]
+enum ShareWhat {
+    #[default]
+    Song,
+    Clip,
+    /// Every track as its own WAV.
+    Stems,
+}
+
 #[derive(Default)]
 struct ShareUi {
     open: bool,
     preset: usize,
     opts: ShareOptions,
-    clip: bool,
+    what: ShareWhat,
     from: f32,
     to: f32,
     ffmpeg: Option<PathBuf>,
@@ -115,6 +126,36 @@ struct Snapshot {
     knobs: Knobs,
     in_peak: f32,
     out_peak: f32,
+}
+
+/// Live loudness of what you hear, in LUFS (the unit streaming sites normalise to).
+#[derive(Default)]
+struct Loudness {
+    meter: Option<EbuR128>,
+    sr: u32,
+    frames: u64,
+    scratch: Vec<f32>,
+    short_term: Option<f64>,
+}
+
+impl Loudness {
+    fn update(&mut self, sr: f32) {
+        let sr = sr as u32;
+        if self.meter.is_none() || self.sr != sr {
+            self.meter = EbuR128::new(2, sr, Mode::S).ok();
+            self.sr = sr;
+        }
+        if let Some(m) = self.meter.as_mut() {
+            if !self.scratch.is_empty() {
+                let _ = m.add_frames_f32(&self.scratch);
+            }
+            self.short_term = m
+                .loudness_shortterm()
+                .ok()
+                .filter(|v| v.is_finite() && *v > -70.0);
+        }
+        self.scratch.clear();
+    }
 }
 
 /// Waveform of the take being recorded, built up as samples arrive.
@@ -207,6 +248,9 @@ pub struct App {
     sel: Option<Selection>,
     drag: Option<Drag>,
     menu_target: Option<Selection>,
+    /// Marker being edited from its right-click menu: (id, name being typed).
+    marker_edit: Option<(u64, String)>,
+    loudness: Loudness,
     live: LiveRec,
     snap_to_beat: bool,
     count_in: bool,
@@ -270,6 +314,8 @@ impl App {
             sel: None,
             drag: None,
             menu_target: None,
+            marker_edit: None,
+            loudness: Loudness::default(),
             live: LiveRec::default(),
             snap_to_beat: false,
             count_in: false,
@@ -338,6 +384,21 @@ impl App {
         }
         .unwrap_or(FxTarget::Master);
         self.add_plugin(target, r);
+    }
+
+    /// Result text of the last Share/stems export, once finished (for tests).
+    pub fn take_share_result(&mut self) -> Option<String> {
+        let done = self.share.job.lock().as_mut().and_then(Option::take);
+        if done.is_some() {
+            *self.share.job.lock() = None;
+        }
+        done.map(|r| match r {
+            Ok(s) | Err(s) => s,
+        })
+    }
+
+    pub fn loudness_short_term(&self) -> Option<f64> {
+        self.loudness.short_term
     }
 
     pub fn doc(&self) -> &Doc {
@@ -460,6 +521,7 @@ impl App {
         if e.recording {
             e.recorded_since(self.live.consumed, &mut self.live.scratch);
         }
+        self.loudness.frames = e.output_since(self.loudness.frames, &mut self.loudness.scratch);
         let s = Snapshot {
             playing: e.playing,
             recording: e.recording,
@@ -484,6 +546,7 @@ impl App {
         e.out_peak = 0.0;
         drop(e);
         self.live.absorb();
+        self.loudness.update(s.sr);
         s
     }
 
@@ -949,6 +1012,63 @@ impl App {
         };
     }
 
+    fn join_selected(&mut self) {
+        self.status = match self.sel {
+            Some(Selection::Clip(id)) => match self.doc.join_with_next(id) {
+                Some(_) => "Joined with the next clip (Ctrl+Z to undo)".into(),
+                None => "There's no later clip on this track to join with.".into(),
+            },
+            _ => "Select a clip first, then press H to join it with the next one.".into(),
+        };
+    }
+
+    fn add_marker(&mut self, at: usize, sr: f32) {
+        self.status = match self.doc.add_marker(at, (sr * 0.05) as usize) {
+            Some(_) => "Added a marker. Right-click it in the ruler to rename it.".into(),
+            None => "There's already a marker here.".into(),
+        };
+    }
+
+    fn marker_near(&self, rect: Rect, x: f32, sr: f32) -> Option<u64> {
+        self.doc
+            .markers
+            .iter()
+            .map(|m| {
+                (
+                    m.id,
+                    (rect.left() + m.pos as f32 / sr * self.px_per_sec - x).abs(),
+                )
+            })
+            .filter(|(_, d)| *d <= 7.0)
+            .min_by(|a, b| a.1.total_cmp(&b.1))
+            .map(|(id, _)| id)
+    }
+
+    fn marker_menu(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
+        let Some((id, mut name)) = self.marker_edit.take() else {
+            return;
+        };
+        ui.label(RichText::new("Marker").strong());
+        let r = ui.text_edit_singleline(&mut name);
+        let enter = r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+        if ui.button("Rename").clicked() || enter {
+            self.doc.rename_marker(id, name.trim().to_string());
+            ui.close();
+        }
+        if ui.button("Go to").clicked() {
+            if let Some(m) = self.doc.markers.iter().find(|m| m.id == id) {
+                actions.push(Action::Seek(m.pos));
+            }
+            ui.close();
+        }
+        if ui.button("Delete marker").clicked() {
+            self.doc.delete_marker(id);
+            ui.close();
+            return;
+        }
+        self.marker_edit = Some((id, name));
+    }
+
     fn nudge(&mut self, samples: isize) {
         if let Some(Selection::Clip(id)) = self.sel
             && let Some(c) = self.doc.clip(id)
@@ -1022,6 +1142,10 @@ impl App {
                     Key::Plus,
                     Key::Minus,
                     Key::F1,
+                    Key::M,
+                    Key::H,
+                    Key::OpenBracket,
+                    Key::CloseBracket,
                 ]
                 .map(|k| (k, pressed(k))),
                 i.modifiers.command,
@@ -1054,6 +1178,20 @@ impl App {
                 }
                 (Key::Minus, _) => self.px_per_sec = (self.px_per_sec / 1.25).max(10.0),
                 (Key::F1, _) => self.show_help = !self.show_help,
+                (Key::M, false) => self.add_marker(snap.playhead, snap.sr),
+                (Key::H, false) => self.join_selected(),
+                (Key::OpenBracket, _) => {
+                    // A little slack so pressing it during playback keeps stepping back.
+                    let slack = (snap.sr * 0.3) as usize * usize::from(snap.playing);
+                    if let Some(p) = self.doc.prev_marker(snap.playhead, slack) {
+                        actions.push(Action::Seek(p));
+                    }
+                }
+                (Key::CloseBracket, _) => {
+                    if let Some(p) = self.doc.next_marker(snap.playhead) {
+                        actions.push(Action::Seek(p));
+                    }
+                }
                 _ => {}
             }
         }
@@ -1169,7 +1307,7 @@ impl App {
             return;
         }
         let opts = self.share.opts.clone();
-        let clip = self.share.clip.then_some((self.share.from, self.share.to));
+        let clip = (self.share.what == ShareWhat::Clip).then_some((self.share.from, self.share.to));
         // Plugins have to run on this (UI) thread, so a song with plugins is mixed here
         // with separate plugin copies; the encoding still happens in the background.
         let uses_plugins = tracks
@@ -1209,6 +1347,95 @@ impl App {
                 Ok(share::export(&mix, sr as u32, preset, &opts, &out)?.summary())
             };
             *job.lock() = Some(Some(run().map_err(|e| format!("Export failed: {e:#}"))));
+        });
+    }
+
+    /// Exports every track with audio as its own WAV (stems).
+    fn start_stems(&mut self) {
+        let Some(dir) = rfd::FileDialog::new()
+            .set_title("Choose a folder for the stems")
+            .pick_folder()
+        else {
+            return;
+        };
+        self.export_stems(dir);
+    }
+
+    /// Writes the stems into `dir` (in the background). Public for tests.
+    pub fn export_stems(&mut self, dir: PathBuf) {
+        let sr = self.engine.lock().sr;
+        let safe = |s: &str| -> String {
+            s.chars()
+                .map(|c| {
+                    if c.is_alphanumeric() || " -_()".contains(c) {
+                        c
+                    } else {
+                        '_'
+                    }
+                })
+                .collect::<String>()
+                .trim()
+                .to_string()
+        };
+        let jobs: Vec<(String, Track)> = self
+            .doc
+            .tracks
+            .iter()
+            .filter(|t| !t.clips.is_empty())
+            .enumerate()
+            .map(|(i, t)| {
+                let mut t = t.clone();
+                t.mute = false;
+                t.solo = false;
+                (format!("{:02} - {}.wav", i + 1, safe(&t.name)), t)
+            })
+            .collect();
+        if jobs.is_empty() {
+            self.share.result = Some("Record something first.".into());
+            return;
+        }
+        // Like a normal export: plugins render here, with their own copies.
+        let uses_plugins = jobs
+            .iter()
+            .flat_map(|(_, t)| &t.fx)
+            .any(|f| f.kind == FxKind::Plugin);
+        let premixed: Option<Vec<Vec<f32>>> = if uses_plugins {
+            self.capture_plugin_states();
+            let plugins = &mut self.plugins;
+            let mixes = jobs
+                .iter()
+                .map(|(_, t)| {
+                    render_mix(std::slice::from_ref(t), &[], sr, &mut |s| {
+                        plugins.make_offline_effect(s)
+                    })
+                })
+                .collect();
+            self.plugins.end_offline();
+            Some(mixes)
+        } else {
+            None
+        };
+        let job = self.share.job.clone();
+        *job.lock() = Some(None);
+        self.share.result = None;
+        std::thread::spawn(move || {
+            let run = || -> anyhow::Result<String> {
+                for (i, (name, t)) in jobs.iter().enumerate() {
+                    let mix = match &premixed {
+                        Some(m) => m[i].clone(),
+                        None => render_mix(std::slice::from_ref(t), &[], sr, &mut |_| None),
+                    };
+                    project::export_mix(&dir.join(name), &mix, sr as u32)?;
+                }
+                Ok(format!(
+                    "Exported {} stems to {}",
+                    jobs.len(),
+                    dir.display()
+                ))
+            };
+            *job.lock() = Some(Some(
+                run().map_err(|e| format!("Stems export failed: {e:#}")),
+            ));
         });
     }
 
@@ -1302,11 +1529,25 @@ impl App {
                     ui.end_row();
                     ui.label("What");
                     ui.horizontal(|ui| {
-                        ui.radio_value(&mut self.share.clip, false, "Whole song");
-                        ui.radio_value(&mut self.share.clip, true, "Clip");
+                        ui.radio_value(&mut self.share.what, ShareWhat::Song, "Whole song");
+                        ui.radio_value(&mut self.share.what, ShareWhat::Clip, "Clip");
+                        ui.radio_value(&mut self.share.what, ShareWhat::Stems, "Stems")
+                            .on_hover_text("Every track as its own WAV file, ready to open in another DAW");
                     });
                     ui.end_row();
-                    if self.share.clip {
+                    if self.share.what == ShareWhat::Stems {
+                        ui.label("");
+                        ui.label(
+                            RichText::new(
+                                "One 24-bit WAV per track, with its effects, volume and pan (not the master effects). \
+                                 They all start at 0:00 so they line up when dropped into any DAW.",
+                            )
+                            .small()
+                            .weak(),
+                        );
+                        ui.end_row();
+                    }
+                    if self.share.what == ShareWhat::Clip {
                         let now = snap.playhead as f32 / snap.sr;
                         ui.label("");
                         ui.horizontal(|ui| {
@@ -1326,9 +1567,15 @@ impl App {
 
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
-                    let can = !busy && (ffmpeg || !preset.needs_ffmpeg());
-                    if ui.add_enabled(can, egui::Button::new(RichText::new("Export…").strong())).clicked() {
-                        self.start_share();
+                    let stems = self.share.what == ShareWhat::Stems;
+                    let can = !busy && (stems || ffmpeg || !preset.needs_ffmpeg());
+                    let label = if stems { "Export stems…" } else { "Export…" };
+                    if ui.add_enabled(can, egui::Button::new(RichText::new(label).strong())).clicked() {
+                        if stems {
+                            self.start_stems();
+                        } else {
+                            self.start_share();
+                        }
                     }
                     if busy {
                         ui.spinner();
@@ -1371,6 +1618,9 @@ impl App {
                             ("Drag a clip's edge", "Trim it"),
                             ("Right-click", "Menu for a clip or track"),
                             ("S", "Split at the playhead"),
+                            ("H", "Join the selected clip with the next one"),
+                            ("M", "Add a marker at the playhead"),
+                            ("[ / ]", "Jump to the previous / next marker"),
                             ("Delete / Backspace", "Delete the selected clip or track"),
                             ("Ctrl+D", "Duplicate"),
                             ("Ctrl+Z", "Undo"),
@@ -1543,6 +1793,19 @@ impl App {
             );
         meter(ui, "In", self.in_meter);
         meter(ui, "Out", self.out_meter);
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Loudness").small());
+            let (text, col) = match self.loudness.short_term {
+                Some(v) if (v + 14.0).abs() <= 1.5 => (format!("{v:.1} LUFS"), Color32::from_rgb(90, 200, 120)),
+                Some(v) if v > -12.5 => (format!("{v:.1} LUFS"), AMBER),
+                Some(v) => (format!("{v:.1} LUFS"), ui.visuals().text_color()),
+                None => ("—".to_string(), ui.visuals().weak_text_color()),
+            };
+            ui.label(RichText::new(text).monospace().color(col)).on_hover_text(
+                "How loud what you hear is, over the last 3 seconds. Streaming sites play songs at about -14 LUFS \
+                 (green). Share matches that for you when exporting, so this is just a guide.",
+            );
+        });
         ui.add(egui::Slider::new(&mut knobs.latency_ms, 0.0..=80.0).text("Latency ms"))
             .on_hover_text(
                 "Lines new takes up with old ones. If a new take sounds late against the others, raise this; if early, lower it.",
@@ -2128,6 +2391,11 @@ impl App {
     }
 
     fn clip_menu(&mut self, ui: &mut egui::Ui, clip: u64, snap: &Snapshot) {
+        if ui.button("Join with next clip    H").clicked() {
+            self.sel = Some(Selection::Clip(clip));
+            self.join_selected();
+            ui.close();
+        }
         if ui.button("Split at playhead    S").clicked() {
             self.sel = Some(Selection::Clip(clip));
             self.split_at(snap.playhead);
@@ -2308,7 +2576,13 @@ impl App {
                 }
                 Hit::Ruler | Hit::Empty { .. } => {
                     self.sel = None;
-                    actions.push(Action::Seek(to_samples(p.x)));
+                    // Clicking a marker flag lands exactly on it.
+                    let marker = (p.y < rect.top() + RULER_H)
+                        .then(|| self.marker_near(rect, p.x, sr))
+                        .flatten()
+                        .and_then(|id| self.doc.markers.iter().find(|m| m.id == id))
+                        .map(|m| m.pos);
+                    actions.push(Action::Seek(marker.unwrap_or_else(|| to_samples(p.x))));
                 }
             }
         }
@@ -2321,6 +2595,19 @@ impl App {
         if resp.secondary_clicked()
             && let Some(p) = resp.interact_pointer_pos()
         {
+            self.marker_edit = None;
+            if p.y < rect.top() + RULER_H
+                && let Some(id) = self.marker_near(rect, p.x, sr)
+            {
+                let name = self
+                    .doc
+                    .markers
+                    .iter()
+                    .find(|m| m.id == id)
+                    .map(|m| m.name.clone())
+                    .unwrap_or_default();
+                self.marker_edit = Some((id, name));
+            }
             self.menu_target = match self.hit_test(rect, p, sr) {
                 Hit::ClipBody { clip, .. }
                 | Hit::ClipStart { clip, .. }
@@ -2331,9 +2618,14 @@ impl App {
             self.sel = self.menu_target;
         }
         resp.context_menu(|ui| match self.menu_target {
+            _ if self.marker_edit.is_some() => self.marker_menu(ui, actions),
             Some(Selection::Clip(c)) => self.clip_menu(ui, c, snap),
             Some(Selection::Track(t)) => self.track_menu(ui, t, snap),
             None => {
+                if ui.button("Add marker at playhead    M").clicked() {
+                    self.add_marker(snap.playhead, snap.sr);
+                    ui.close();
+                }
                 if ui.button("Split everything at playhead    S").clicked() {
                     self.split_at(snap.playhead);
                     ui.close();
@@ -2418,6 +2710,38 @@ impl App {
                     text_col,
                 );
             }
+        }
+
+        // Markers: a flag in the ruler and a faint line down through the tracks.
+        for m in &self.doc.markers {
+            let x = x_of(m.pos);
+            if x < visible.left() - 200.0 || x > visible.right() {
+                continue;
+            }
+            painter.line_segment(
+                [pos2(x, rect.top() + RULER_H), pos2(x, rect.bottom())],
+                Stroke::new(1.0, AMBER.gamma_multiply(0.35)),
+            );
+            painter.add(egui::Shape::convex_polygon(
+                vec![
+                    pos2(x, rect.top() + 11.0),
+                    pos2(x + 8.0, rect.top() + 15.0),
+                    pos2(x, rect.top() + 19.0),
+                ],
+                AMBER,
+                Stroke::NONE,
+            ));
+            painter.line_segment(
+                [pos2(x, rect.top() + 11.0), pos2(x, rect.top() + RULER_H)],
+                Stroke::new(1.5, AMBER),
+            );
+            painter.text(
+                pos2(x + 10.0, rect.top() + 15.0),
+                Align2::LEFT_CENTER,
+                &m.name,
+                FontId::proportional(11.0),
+                AMBER,
+            );
         }
 
         // Clips.
@@ -2584,6 +2908,12 @@ impl eframe::App for App {
                     let has = self.sel.is_some();
                     if ui.button("Split at playhead    S").clicked() {
                         self.split_at(snap.playhead);
+                    }
+                    if ui.button("Join with next clip    H").clicked() {
+                        self.join_selected();
+                    }
+                    if ui.button("Add marker    M").clicked() {
+                        self.add_marker(snap.playhead, snap.sr);
                     }
                     if ui
                         .add_enabled(has, egui::Button::new("Duplicate    Ctrl+D"))

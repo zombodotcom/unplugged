@@ -313,3 +313,93 @@ fn plugin_browser_free_tab() {
     steps(&mut h, 3);
     shot(&mut h, "plugin_browser");
 }
+
+fn playhead(h: &Harness<'_, App>) -> usize {
+    h.state().engine().lock().playhead
+}
+
+#[test]
+fn markers_add_jump_and_menu() {
+    let mut h = harness();
+    key(&mut h, Key::M, Modifiers::NONE); // at 0:00
+    click(&mut h, pos2(x_at(5.0), 70.0), PointerButton::Primary); // ruler -> 5 s
+    key(&mut h, Key::M, Modifiers::NONE);
+    assert_eq!(h.state().doc().markers.len(), 2);
+    key(&mut h, Key::OpenBracket, Modifiers::NONE);
+    assert_eq!(playhead(&h), 0, "[ jumps back to the first marker");
+    key(&mut h, Key::CloseBracket, Modifiers::NONE);
+    assert!(
+        (playhead(&h) as f32 / 48000.0 - 5.0).abs() < 0.05,
+        "] jumps to the next marker"
+    );
+    click(
+        &mut h,
+        pos2(x_at(5.0) + 2.0, 82.0),
+        PointerButton::Secondary,
+    );
+    shot(&mut h, "marker_menu");
+}
+
+#[test]
+fn join_with_h() {
+    let mut h = harness();
+    // The demo's Lead track is split at 6 s; its left clip is selected.
+    assert_eq!(clips(&h, 1), 2);
+    key(&mut h, Key::H, Modifiers::NONE);
+    assert_eq!(clips(&h, 1), 1);
+    let c = &h.state().doc().tracks[1].clips[0];
+    assert!((c.len as f32 / 48000.0 - 6.0).abs() < 0.01);
+    key(&mut h, Key::Z, Modifiers::COMMAND);
+    assert_eq!(clips(&h, 1), 2);
+}
+
+#[test]
+fn stems_export_writes_one_wav_per_track() {
+    let mut h = harness();
+    let dir = std::env::temp_dir().join(format!("unplugged-stems-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    h.state_mut().export_stems(dir.clone());
+    let mut result = None;
+    for _ in 0..200 {
+        result = h.state_mut().take_share_result();
+        if result.is_some() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let result = result.expect("stems export finished");
+    assert!(result.contains("Exported 2 stems"), "{result}");
+    let mut names: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+        .collect();
+    names.sort();
+    assert_eq!(names, ["01 - Rhythm.wav", "02 - Lead.wav"]);
+    // Stems line up: the Lead stem has silence before its first clip at 3 s.
+    let lead = hound::WavReader::open(dir.join("02 - Lead.wav")).unwrap();
+    let samples: Vec<i32> = lead.into_samples::<i32>().map(Result::unwrap).collect();
+    assert!(
+        samples[..2 * 48000 * 2].iter().all(|s| *s == 0),
+        "silence before 3 s"
+    );
+    assert!(samples.iter().any(|s| *s != 0));
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn loudness_meter_reads_what_you_hear() {
+    let mut h = harness();
+    let engine = h.state().engine();
+    {
+        let mut e = engine.lock();
+        e.monitor = false;
+        e.play();
+        let mut out = vec![0.0; 48000 * 4 * 2];
+        e.render(&mut VecDeque::new(), &mut out);
+    }
+    // The meter keeps the last second of output; feed it over a few frames.
+    steps(&mut h, 3);
+    let l = h.state().loudness_short_term();
+    assert!(l.is_some_and(|v| v > -40.0 && v < 0.0), "{l:?}");
+    shot(&mut h, "loudness");
+}

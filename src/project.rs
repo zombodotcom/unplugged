@@ -6,7 +6,7 @@
 
 use crate::dsp::{MAX_IR_SECONDS, SimParams, normalize_energy};
 use crate::fx::{FxKind, FxSlot};
-use crate::model::{Clip, Doc, Song, Track, compute_peaks};
+use crate::model::{Clip, Doc, Marker, Song, Track, compute_peaks};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -26,6 +26,8 @@ pub struct ProjectFile {
     pub input_fx: Vec<FxSlot>,
     #[serde(default)]
     pub master_fx: Vec<FxSlot>,
+    #[serde(default)]
+    pub markers: Vec<Marker>,
     /// v1/v2 projects: acoustic-sim settings shared by "acoustic" tracks.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sim: Option<SimParams>,
@@ -137,6 +139,7 @@ pub fn save_incremental(
         tracks: entries,
         input_fx: song.input_fx.clone(),
         master_fx: song.master_fx.clone(),
+        markers: song.markers.clone(),
         sim: None,
     };
     // Write then rename, so a crash mid-save never leaves a half-written project.json.
@@ -244,6 +247,15 @@ pub fn load(dir: &Path, sr: u32, doc: &mut Doc) -> Result<(ProjectFile, Song)> {
             invert: e.invert,
         });
     }
+    let markers = pf
+        .markers
+        .iter()
+        .map(|m| Marker {
+            id: doc.new_id(),
+            pos: scale(m.pos),
+            name: m.name.clone(),
+        })
+        .collect();
     let input_fx = doc.copy_fx(&pf.input_fx);
     let master_fx = doc.copy_fx(&pf.master_fx);
     Ok((
@@ -252,6 +264,7 @@ pub fn load(dir: &Path, sr: u32, doc: &mut Doc) -> Result<(ProjectFile, Song)> {
             tracks,
             input_fx,
             master_fx,
+            markers,
         },
     ))
 }
@@ -383,6 +396,8 @@ mod tests {
         d.track_mut(tid).unwrap().solo = true;
         d.add_fx(crate::model::FxTarget::Track(tid), FxKind::Reverb);
         d.add_fx(crate::model::FxTarget::Master, FxKind::Limiter);
+        d.add_marker(700, 10);
+        d.rename_marker(d.markers[0].id, "Chorus".into());
         d.track_mut(tid).unwrap().fx[0].params[2] = 0.7;
         let right = d.split(cid, 980).unwrap();
         d.duplicate(crate::model::Selection::Clip(right));
@@ -399,6 +414,10 @@ mod tests {
         assert_eq!(tracks[0].fx[0].kind, FxKind::Reverb);
         assert_eq!(tracks[0].fx[0].params[2], 0.7);
         assert_eq!(song.master_fx[0].kind, FxKind::Limiter);
+        assert_eq!(
+            (song.markers[0].pos, song.markers[0].name.as_str()),
+            (700, "Chorus")
+        );
         assert!(!tracks[0].invert);
         assert_eq!(tracks[0].clips.len(), 3);
         for pos in [480, 979, 980, 1479, 1480, 1979] {

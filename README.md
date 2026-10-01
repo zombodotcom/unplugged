@@ -19,7 +19,8 @@ Written in Rust with [cpal](https://github.com/RustAudio/cpal) (audio) and [egui
 
 **Editing** (Reaper-style shortcuts)
 - Clips on tracks: **click** to select, **drag** to move (also onto another track), **drag an edge** to trim
-- **S** splits at the playhead, **Delete** deletes, **Ctrl+D** duplicates, **←/→** nudges
+- **S** splits at the playhead, **H** joins a clip with the next one, **Delete** deletes, **Ctrl+D** duplicates, arrow keys nudge
+- **Markers**: **M** drops one at the playhead, **[ ]** jump between them, right-click a marker to rename it
 - **Undo/redo everything** (Ctrl+Z / Ctrl+Shift+Z), including deleting tracks
 - **Right-click** menus on clips and tracks, **Snap** to beats (hold Alt to ignore)
 - Per-track volume, pan, mute, solo, polarity flip, and colours
@@ -44,6 +45,8 @@ Written in Rust with [cpal](https://github.com/RustAudio/cpal) (audio) and [egui
 
 **Sharing**
 - **Share / Export** presets for YouTube, Shorts, TikTok, Reels, X/Facebook, SoundCloud, MP3, Discord and Master WAV (see below)
+- **Stems**: every track as its own 24-bit WAV, lined up from 0:00, to take into any other DAW
+- **Live loudness meter** (LUFS) showing how close you are to the −14 LUFS streaming sites play at
 
 **Setup**
 - Automatically picks a Scarlett and its instrument input (Input 2 on a Scarlett Solo), and remembers your devices
@@ -60,7 +63,10 @@ We looked for simple features users have begged for on DAW forums for years. Sev
 | Keep what you played before hitting record (audio) | Bitwig, most DAWs | years | ✅ ⟲ Capture |
 | Polarity flip on every track | Pro Tools | 2009 | ✅ track menu |
 | Save and load effect chains | Pro Tools | 2009 | ✅ chain presets |
-| Loudness (LUFS) for streaming | Ableton Live | ~2015 | ½ Share matches −14 LUFS; a live meter is planned |
+| Loudness (LUFS) meter | Ableton Live | ~2015 | ✅ live meter + Share matches −14 LUFS |
+| Export every track as a stem in one go | GarageBand | years | ✅ Share → Stems |
+| Better markers | Pro Tools | 2009 | ✅ M, [ ], rename |
+| Join split clips back together | Audacity | 2023 | ✅ H |
 
 Sources and the full list: [ROADMAP.md](ROADMAP.md#things-other-daws-never-fixed).
 
@@ -103,6 +109,9 @@ unplugged-share song.wav -p soundcloud
 | C | Capture the last minute you played |
 | Home / End | Jump to start / end |
 | S | Split at the playhead |
+| H | Join the selected clip with the next one |
+| M | Add a marker at the playhead |
+| [ / ] | Jump to the previous / next marker |
 | Delete / Backspace | Delete selected clip or track |
 | Ctrl+D | Duplicate |
 | Ctrl+Z / Ctrl+Shift+Z | Undo / redo |

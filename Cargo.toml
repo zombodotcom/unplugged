@@ -1,6 +1,6 @@
 [package]
 name = "unplugged"
-version = "0.5.0"
+version = "0.6.0"
 description = "A free, open-source DAW for recording at home: multitrack, effects, one-click sharing"
 license = "MIT"
 repository = "https://github.com/zombodotcom/unplugged"

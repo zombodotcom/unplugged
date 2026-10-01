@@ -41,11 +41,11 @@ Simple features users have asked DAW makers for over years, often with hundreds 
 | Always-on audio capture (keep what you played before hitting record) | Bitwig, most DAWs | years | 60-post KVR thread; paid plugins exist to fill the gap ([KVR](https://www.kvraudio.com/forum/viewtopic.php?p=8538428)) | ✅ ⟲ Capture |
 | Polarity flip on every channel | Pro Tools | 2009 | IdeaScale top 10 ([SOS](https://www.soundonsound.com/techniques/pro-tools-most-wanted-features)) | ✅ |
 | Save/load effect chains | Pro Tools | 2009 | IdeaScale #3 ([Production Expert](https://www.production-expert.com/home-page/2016/6/29/pro-tools-ideascale-top-20-saveload-plug-in-chains)) | ✅ sim presets |
-| Built-in LUFS meter | Ableton Live | ~2015 | Several threads ([Ableton forum](https://forum.ableton.com/viewtopic.php?t=239115)) | ½ export matches LUFS; live meter next |
-| Export every track as a stem in one go | GarageBand | years | Apple Community threads ([Apple](https://discussions.apple.com/thread/254890741)) | next |
-| Better markers | Pro Tools | 2009 | IdeaScale #4 ([SOS](https://www.soundonsound.com/techniques/pro-tools-most-wanted-features)) | next |
+| Built-in LUFS meter | Ableton Live | ~2015 | Several threads ([Ableton forum](https://forum.ableton.com/viewtopic.php?t=239115)) | ✅ live meter |
+| Export every track as a stem in one go | GarageBand | years | Apple Community threads ([Apple](https://discussions.apple.com/thread/254890741)) | ✅ Share → Stems |
+| Better markers | Pro Tools | 2009 | IdeaScale #4 ([SOS](https://www.soundonsound.com/techniques/pro-tools-most-wanted-features)) | ✅ |
 | Split a stereo file into two mono tracks | Studio One | 2016 | ([PreSonus feedback](https://feedback-software.presonus.com/feedback/139381)) | planned |
-| Mute part of a clip / join two clips | Audacity | 2023 | GitHub [#5064](https://github.com/audacity/audacity/issues/5064), [#5509](https://github.com/audacity/audacity/issues/5509) | planned (join = "heal split") |
+| Mute part of a clip / join two clips | Audacity | 2023 | GitHub [#5064](https://github.com/audacity/audacity/issues/5064), [#5509](https://github.com/audacity/audacity/issues/5509) | ½ join ✅ (H); muting part of a clip still to do |
 | Several projects open at once (tabs) | Pro Tools, FL Studio | ~2009 | IdeaScale #6 ([Production Expert 2026](https://www.production-expert.com/production-expert-1/3-pro-tools-features-still-missing-in-2026)) | later |
 
 ## Phase 1.5: Effects ✅ (v0.4)
