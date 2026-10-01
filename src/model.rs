@@ -286,6 +286,21 @@ impl Doc {
         Some(id)
     }
 
+    /// Adds a plugin to the end of a chain. Returns its slot id.
+    pub fn add_plugin_fx(
+        &mut self,
+        target: FxTarget,
+        plugin: crate::plugins::PluginRef,
+    ) -> Option<u64> {
+        self.fx_chain(target)?;
+        self.checkpoint();
+        let slot = FxSlot::new_plugin(self.new_id(), plugin);
+        let id = slot.id;
+        self.fx_chain_mut(target)?.push(slot);
+        self.touch();
+        Some(id)
+    }
+
     /// Adds a track holding one clip, with effects `fx`. Returns the track id.
     pub fn add_track(&mut self, name: String, clip: Option<Clip>, fx: Vec<FxSlot>) -> u64 {
         self.checkpoint();

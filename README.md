@@ -31,6 +31,13 @@ Written in Rust with [cpal](https://github.com/RustAudio/cpal) (audio) and [egui
 - **Save and load chains as presets**
 - Click a track's **FX** button (or any clip) to see its effects
 
+**Plugins (VST3 and CLAP)**
+- Load the **VST3 and CLAP** plugins installed on your computer into any effect chain, and open their own windows
+- Plugin settings are saved with your project, autosaved, included in exports, and restored by undo
+- A **plugin browser** (**Plugins** button) lists what you have installed and has a **Get free plugins** tab: a checked list of good free plugins, with guitar ones (Neural Amp Modeler, AIDA-X, BYOD, ChowCentaur) marked 🎸
+- Both formats are free, open standards: CLAP is MIT-licensed, and the VST3 SDK has been MIT since October 2025. Hosting uses [clack](https://github.com/prokopyl/clack) and [vst3-host](https://github.com/HelgeSverre/rust-vst3-host).
+- Instruments (synths) need MIDI tracks, which aren't in Unplugged yet. For now plugins are effects.
+
 **Safety**
 - **Background autosave** every 30 s (only new audio gets written, so it never freezes). If Unplugged crashes, it offers to recover your session next time.
 - Asks before closing with unsaved work
@@ -123,12 +130,16 @@ src/
   model.rs    the song: tracks, clips, edit operations, undo/redo
   engine.rs   real-time engine: monitoring, playback, recording, count-in, capture, mixdown
   fx.rs       built-in effects and effect chains
+  plugins/    VST3/CLAP hosting, plugin windows, scanning, free plugin catalog
   dsp.rs      filters, FFT convolution and the acoustic-sim DSP
   audio.rs    cpal device/stream handling, Scarlett auto-detection, resampling
   project.rs  project save/load (incl. autosave), WAV import/export
   share.rs    social-media export: loudness, encoders, video
   bin/unplugged-share.rs   command-line exporter
-tests/ui.rs   offscreen UI tests (click, drag, delete, undo, record) with screenshots
+tests/ui.rs   offscreen UI tests (click, drag, delete, undo, record, plugins) with screenshots
+examples/
+  devices.rs       `cargo run --example devices` lists devices as cpal sees them
+  plugin_check.rs  loads plugins headlessly and checks processing, state and windows
 ```
 
 Run tests with `cargo test`. UI test screenshots land in `target/ui-shots/`.

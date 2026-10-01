@@ -52,7 +52,8 @@ Simple features users have asked DAW makers for over years, often with hundreds 
 
 - ✅ Effect chains per track, Input and Master; EQ, Compressor, Gate, Limiter, Drive, Chorus, Delay, Reverb, Utility, Acoustic sim
 - ✅ Chain presets, undoable edits
-- Next: **load VST3/CLAP plugins**. Rust hosting crates now exist: [clack](https://github.com/prokopyl/clack) for CLAP and [plugin_host](https://lib.rs/crates/plugin_host) for VST3 + CLAP. The work is showing plugin windows and keeping a crashing plugin from taking the app down. **L**
+- ✅ **VST3 and CLAP plugins** (v0.5) via [clack](https://github.com/prokopyl/clack) and [vst3-host](https://github.com/HelgeSverre/rust-vst3-host): effect chains, plugin windows, saved settings, exports, plugin browser with a checked list of free plugins
+- Next for plugins: run them in a separate process so a crashing plugin can't take the app down (vst3-host has process isolation); MIDI tracks so instrument plugins (synths) work; showing plugin parameters for automation. **L**
 - Next: automation lanes (volume/pan/effect knobs over time), sends to a shared reverb bus, a live LUFS meter. **M each**
 
 ## Phase 2: Share exporter (the big one)

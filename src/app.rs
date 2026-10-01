@@ -2,6 +2,7 @@ use crate::audio::{self, DeviceInfo, ErrorSlot, InputQueue, RunningAudio};
 use crate::engine::{CAPTURE_SECONDS, Engine, render_mix};
 use crate::fx::{FxKind, FxSlot};
 use crate::model::{Doc, FxTarget, PEAK_BUCKET, Selection, Song};
+use crate::plugins::{self, InstalledPlugin, PluginHost, PluginRef, catalog};
 use crate::project;
 use crate::share::{self, PRESETS, ShareOptions};
 use cpal::HostId;
@@ -10,6 +11,7 @@ use egui::{
     vec2,
 };
 use parking_lot::Mutex;
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -46,6 +48,18 @@ struct ShareUi {
     /// `Some(None)` while exporting, `Some(Some(result))` when finished.
     job: Arc<Mutex<Option<Option<Result<String, String>>>>>,
     result: Option<String>,
+}
+
+/// The plugin browser window.
+#[derive(Default)]
+struct Browser {
+    open: bool,
+    /// 0 = installed, 1 = free plugins to download.
+    tab: u8,
+    search: String,
+    list: Vec<InstalledPlugin>,
+    loaded_cache: bool,
+    scanning: Option<Arc<Mutex<Option<Vec<InstalledPlugin>>>>>,
 }
 
 /// Background autosave (crash protection). Only new audio is written each time.
@@ -205,6 +219,8 @@ pub struct App {
 
     fx_target: FxTarget,
     fx_last_sel: Option<Selection>,
+    plugins: PluginHost,
+    browser: Browser,
     status: String,
     px_per_sec: f32,
     follow: bool,
@@ -264,6 +280,8 @@ impl App {
             allow_close: false,
             fx_target: FxTarget::Input,
             fx_last_sel: None,
+            plugins: PluginHost::default(),
+            browser: Browser::default(),
             status: String::new(),
             px_per_sec: 60.0,
             follow: true,
@@ -306,6 +324,20 @@ impl App {
         }
         self.sel = Some(Selection::Clip(c2_id));
         self.take_counter = 2;
+    }
+
+    /// Adds a plugin to the selected track's effects (used by UI tests).
+    pub fn add_plugin_for_test(&mut self, r: PluginRef) {
+        let target = match self.sel {
+            Some(Selection::Clip(c)) => self
+                .doc
+                .find_clip(c)
+                .map(|(t, _)| FxTarget::Track(self.doc.tracks[t].id)),
+            Some(Selection::Track(t)) => Some(FxTarget::Track(t)),
+            None => None,
+        }
+        .unwrap_or(FxTarget::Master);
+        self.add_plugin(target, r);
     }
 
     pub fn doc(&self) -> &Doc {
@@ -412,6 +444,9 @@ impl App {
                         output.name
                     );
                 self.audio = Some(a);
+                // Plugins are rebuilt at the device's sample rate on the next sync.
+                self.plugins.set_sample_rate(self.engine.lock().sr);
+                self.synced_rev = self.doc.revision.wrapping_sub(1);
             }
             Err(e) => {
                 self.status = format!("Audio failed: {e:#}");
@@ -576,7 +611,7 @@ impl App {
     fn tick_autosave(&mut self, snap: &Snapshot) {
         if self.autosave.offer_recovery
             || snap.recording
-            || self.doc.revision == self.autosave.saved_rev
+            || (self.doc.revision == self.autosave.saved_rev && self.plugins.is_empty())
             || self.autosave.last.elapsed() < AUTOSAVE_EVERY
             || *self.autosave.busy.lock()
         {
@@ -587,6 +622,7 @@ impl App {
         };
         self.autosave.last = Instant::now();
         self.autosave.saved_rev = self.doc.revision;
+        self.capture_plugin_states();
         let song = self.doc.song();
         let (sr, bpm) = (snap.sr as u32, snap.knobs.bpm);
         let (busy, written) = (self.autosave.busy.clone(), self.autosave.written.clone());
@@ -629,6 +665,163 @@ impl App {
                 }
             });
         });
+    }
+
+    /// Copies every running plugin's current settings into the song.
+    fn capture_plugin_states(&mut self) {
+        let doc = &mut self.doc;
+        let slots = doc
+            .input_fx
+            .iter_mut()
+            .chain(doc.master_fx.iter_mut())
+            .chain(doc.tracks.iter_mut().flat_map(|t| t.fx.iter_mut()));
+        self.plugins.capture_states(slots);
+    }
+
+    fn plugin_slots(&self) -> impl Iterator<Item = &FxSlot> {
+        self.doc
+            .input_fx
+            .iter()
+            .chain(&self.doc.master_fx)
+            .chain(self.doc.tracks.iter().flat_map(|t| &t.fx))
+            .filter(|f| f.kind == FxKind::Plugin)
+    }
+
+    /// Pushes the song to the engine, creating any plugins it needs.
+    fn sync_engine(&mut self) {
+        let plugins = &mut self.plugins;
+        let mut make = |s: &FxSlot| plugins.make_effect(s);
+        let mut e = self.engine.lock();
+        e.set_tracks(&self.doc.tracks, &mut make);
+        e.set_input_fx(&self.doc.input_fx, &mut make);
+        e.set_master_fx(&self.doc.master_fx, &mut make);
+        drop(e);
+        let live: HashSet<u64> = self.plugin_slots().map(|f| f.id).collect();
+        self.plugins.retain(&live);
+    }
+
+    fn add_plugin(&mut self, target: FxTarget, r: PluginRef) {
+        let name = r.name.clone();
+        if self.doc.add_plugin_fx(target, r).is_some() {
+            self.status = format!("Added {name}. Click \"Open window\" in Effects to tweak it.");
+        }
+    }
+
+    fn start_plugin_scan(&mut self) {
+        if self.browser.scanning.is_some() {
+            return;
+        }
+        let slot: Arc<Mutex<Option<Vec<InstalledPlugin>>>> = Default::default();
+        self.browser.scanning = Some(slot.clone());
+        std::thread::spawn(move || {
+            let found = plugins::scan();
+            plugins::save_cache(&found);
+            *slot.lock() = Some(found);
+        });
+    }
+
+    fn browser_window(&mut self, ctx: &egui::Context) {
+        if !self.browser.open {
+            return;
+        }
+        if !self.browser.loaded_cache {
+            self.browser.loaded_cache = true;
+            match plugins::load_cache() {
+                Some(list) => self.browser.list = list,
+                None => self.start_plugin_scan(),
+            }
+        }
+        let finished = self
+            .browser
+            .scanning
+            .as_ref()
+            .and_then(|slot| slot.lock().take());
+        if let Some(list) = finished {
+            self.browser.list = list;
+            self.browser.scanning = None;
+        }
+        let target = self.fx_target;
+        let target_name = match target {
+            FxTarget::Input => "Input".to_string(),
+            FxTarget::Master => "Master".to_string(),
+            FxTarget::Track(id) => self
+                .doc
+                .track(id)
+                .map_or("track".into(), |t| t.name.clone()),
+        };
+        let mut open = self.browser.open;
+        let mut add: Option<PluginRef> = None;
+        let mut rescan = false;
+        egui::Window::new("Plugins")
+            .open(&mut open)
+            .default_size([600.0, 480.0])
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.selectable_value(&mut self.browser.tab, 0, "On this computer");
+                    ui.selectable_value(&mut self.browser.tab, 1, "Get free plugins");
+                });
+                ui.separator();
+                if self.browser.tab == 0 {
+                    ui.horizontal(|ui| {
+                        ui.label("Adds to:");
+                        ui.label(RichText::new(&target_name).strong().color(AMBER));
+                        ui.add(egui::TextEdit::singleline(&mut self.browser.search).hint_text("Search").desired_width(160.0));
+                        if self.browser.scanning.is_some() {
+                            ui.spinner();
+                            ui.label("Scanning…");
+                        } else if ui.button("Rescan").on_hover_text("Look again after installing plugins").clicked() {
+                            rescan = true;
+                        }
+                    });
+                    ui.add_space(4.0);
+                    if self.browser.list.is_empty() && self.browser.scanning.is_none() {
+                        ui.label("No VST3 or CLAP plugins found. Get some free ones on the next tab, install them, then press Rescan.");
+                    }
+                    let q = self.browser.search.to_lowercase();
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        for p in self.browser.list.iter().filter(|p| {
+                            q.is_empty() || p.name.to_lowercase().contains(&q) || p.vendor.to_lowercase().contains(&q)
+                        }) {
+                            ui.horizontal(|ui| {
+                                let b = ui
+                                    .add_enabled(!p.instrument, egui::Button::new("Add"))
+                                    .on_disabled_hover_text("Instruments need MIDI tracks, which Unplugged doesn't have yet.");
+                                if b.clicked() {
+                                    add = Some(p.to_ref());
+                                }
+                                ui.label(RichText::new(&p.name).strong());
+                                let kind = if p.instrument { "instrument" } else { "effect" };
+                                ui.label(RichText::new(format!("{} · {} · {}", p.format.label(), kind, p.vendor)).small().weak());
+                            });
+                        }
+                    });
+                } else {
+                    ui.label("Free plugins that work in Unplugged. Install one, then press Rescan on the first tab.");
+                    ui.add_space(6.0);
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        for f in catalog::FREE_PLUGINS {
+                            ui.horizontal_wrapped(|ui| {
+                                ui.hyperlink_to(RichText::new(f.name).strong(), f.url);
+                                if f.guitar {
+                                    ui.label(RichText::new("🎸 guitar").small().color(AMBER));
+                                }
+                                let kind = if f.instrument { "Instrument (needs MIDI, coming later)" } else { "Effect" };
+                                ui.label(RichText::new(format!("{kind} · {} · {}", f.formats, f.license)).small().weak());
+                            });
+                            ui.label(f.what);
+                            ui.add_space(6.0);
+                        }
+                        ui.hyperlink_to("Many more free effects (community list) →", catalog::MORE_FREE_PLUGINS_URL);
+                    });
+                }
+            });
+        self.browser.open = open;
+        if rescan {
+            self.start_plugin_scan();
+        }
+        if let Some(r) = add {
+            self.add_plugin(target, r);
+        }
     }
 
     fn has_unsaved_work(&self) -> bool {
@@ -894,6 +1087,7 @@ impl App {
             let e = self.engine.lock();
             (e.sr as u32, e.bpm)
         };
+        self.capture_plugin_states();
         self.status = match project::save(&dir, sr, bpm, &self.doc.song()) {
             Ok(()) => {
                 self.saved_rev = self.doc.revision;
@@ -976,12 +1170,34 @@ impl App {
         }
         let opts = self.share.opts.clone();
         let clip = self.share.clip.then_some((self.share.from, self.share.to));
+        // Plugins have to run on this (UI) thread, so a song with plugins is mixed here
+        // with separate plugin copies; the encoding still happens in the background.
+        let uses_plugins = tracks
+            .iter()
+            .flat_map(|t| &t.fx)
+            .chain(&master_fx)
+            .any(|f| f.kind == FxKind::Plugin);
+        let premix = if uses_plugins {
+            self.capture_plugin_states();
+            let tracks = self.doc.tracks.clone();
+            let plugins = &mut self.plugins;
+            let mix = render_mix(&tracks, &master_fx, sr, &mut |s| {
+                plugins.make_offline_effect(s)
+            });
+            self.plugins.end_offline();
+            Some(mix)
+        } else {
+            None
+        };
         let job = self.share.job.clone();
         *job.lock() = Some(None);
         self.share.result = None;
         std::thread::spawn(move || {
             let run = || -> anyhow::Result<String> {
-                let mut mix = render_mix(&tracks, &master_fx, sr);
+                let mut mix = match premix {
+                    Some(m) => m,
+                    None => render_mix(&tracks, &master_fx, sr, &mut |_| None),
+                };
                 if let Some((from, to)) = clip {
                     let frames = mix.len() / 2;
                     let a = ((from * sr) as usize).min(frames);
@@ -1396,9 +1612,16 @@ impl App {
                         {
                             undo_point = true;
                         }
-                        let name = RichText::new(slot.kind.name()).strong();
-                        ui.label(if slot.on { name } else { name.weak() })
-                            .on_hover_text(slot.kind.about());
+                        let name = RichText::new(slot.title()).strong();
+                        let tip = match &slot.plugin {
+                            Some(r) => format!(
+                                "{} plugin by {}",
+                                r.format.label(),
+                                if r.vendor.is_empty() { "?" } else { &r.vendor }
+                            ),
+                            None => slot.kind.about().to_string(),
+                        };
+                        // Buttons first (right-aligned), then the name fills what's left.
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui.small_button("✖").on_hover_text("Remove").clicked() {
                                 remove = Some(i);
@@ -1409,8 +1632,47 @@ impl App {
                             if ui.small_button("⏶").on_hover_text("Move up").clicked() {
                                 shift = Some((i, -1));
                             }
+                            ui.with_layout(
+                                egui::Layout::left_to_right(egui::Align::Center),
+                                |ui| {
+                                    ui.add(
+                                        egui::Label::new(if slot.on { name } else { name.weak() })
+                                            .truncate(),
+                                    )
+                                    .on_hover_text(tip);
+                                },
+                            );
                         });
                     });
+                    if let Some(r) = &slot.plugin {
+                        ui.label(RichText::new(r.format.label()).small().weak());
+                        if let Some(err) = self.plugins.failed.get(&slot.id) {
+                            ui.label(RichText::new(format!("⚠ {err}")).small().color(REC_RED));
+                        } else if self.plugins.is_loaded(slot.id) {
+                            if self.plugins.has_editor(slot.id) {
+                                let open = self.plugins.editor_open(slot.id);
+                                if ui
+                                    .button(if open { "Close window" } else { "Open window" })
+                                    .clicked()
+                                {
+                                    if open {
+                                        self.plugins.close_editor(slot.id);
+                                    } else if let Err(e) = self.plugins.open_editor(slot.id) {
+                                        self.status =
+                                            format!("Couldn't open the plugin window: {e:#}");
+                                    }
+                                }
+                            } else {
+                                ui.label(RichText::new("No window of its own.").small().weak());
+                            }
+                        } else {
+                            ui.label(
+                                RichText::new("Starts when audio is running.")
+                                    .small()
+                                    .weak(),
+                            );
+                        }
+                    }
                     ui.add_enabled_ui(slot.on, |ui| {
                         let mut vals = slot.values();
                         for (j, d) in slot.kind.params().iter().enumerate() {
@@ -1471,6 +1733,15 @@ impl App {
                         self.doc.add_fx(target, kind);
                         ui.close();
                     }
+                }
+                ui.separator();
+                if ui
+                    .button("🔌 Plugins (VST3 / CLAP)…")
+                    .on_hover_text("Your installed plugins, and free ones to download")
+                    .clicked()
+                {
+                    self.browser.open = true;
+                    ui.close();
                 }
             });
             ui.menu_button("Chain…", |ui| {
@@ -2248,6 +2519,13 @@ impl eframe::App for App {
     fn on_exit(&mut self) {
         // A clean exit means there's nothing to recover next time.
         project::clear_autosave();
+        // Hand plugins back from the engine before tearing them down.
+        let mut e = self.engine.lock();
+        e.set_tracks(&[], &mut |_| None);
+        e.set_input_fx(&[], &mut |_| None);
+        e.set_master_fx(&[], &mut |_| None);
+        drop(e);
+        self.plugins.retain(&HashSet::new());
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -2326,6 +2604,13 @@ impl eframe::App for App {
                 if ui.button("Audio settings").clicked() {
                     self.show_audio = true;
                 }
+                if ui
+                    .button("Plugins")
+                    .on_hover_text("Installed VST3/CLAP plugins, and free ones to get")
+                    .clicked()
+                {
+                    self.browser.open = true;
+                }
                 if ui.button("Shortcuts").on_hover_text("F1").clicked() {
                     self.show_help = true;
                 }
@@ -2360,6 +2645,8 @@ impl eframe::App for App {
         self.audio_window(&ctx);
         self.share_window(&ctx, &snap);
         self.help_window(&ctx);
+        self.browser_window(&ctx);
+        self.plugins.tick();
         self.recovery_window(&ctx);
         self.close_guard(&ctx);
         self.tick_autosave(&snap);
@@ -2372,10 +2659,7 @@ impl eframe::App for App {
         }
         if self.doc.revision != self.synced_rev {
             self.synced_rev = self.doc.revision;
-            let mut e = self.engine.lock();
-            e.set_tracks(&self.doc.tracks);
-            e.set_input_fx(&self.doc.input_fx);
-            e.set_master_fx(&self.doc.master_fx);
+            self.sync_engine();
         }
         ctx.request_repaint_after(Duration::from_millis(33));
     }

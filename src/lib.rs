@@ -9,5 +9,6 @@ pub mod dsp;
 pub mod engine;
 pub mod fx;
 pub mod model;
+pub mod plugins;
 pub mod project;
 pub mod share;

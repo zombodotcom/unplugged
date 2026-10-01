@@ -6,6 +6,7 @@
 //! running [`Effect`] and keeps that effect's state when only its knobs change.
 
 use crate::dsp::{AcousticSim, Biquad, IrSpectrum, SimParams, builtin_body_ir};
+use crate::plugins::PluginRef;
 use serde::{Deserialize, Serialize};
 use std::f32::consts::PI;
 use std::sync::Arc;
@@ -22,6 +23,8 @@ pub enum FxKind {
     Reverb,
     Utility,
     Acoustic,
+    /// A CLAP or VST3 plugin (see [`FxSlot::plugin`]).
+    Plugin,
 }
 
 pub struct ParamDef {
@@ -92,6 +95,7 @@ impl FxKind {
             FxKind::Reverb => "Reverb",
             FxKind::Utility => "Utility",
             FxKind::Acoustic => "Acoustic sim",
+            FxKind::Plugin => "Plugin",
         }
     }
 
@@ -107,6 +111,7 @@ impl FxKind {
             FxKind::Reverb => "Room / hall ambience",
             FxKind::Utility => "Volume and stereo width",
             FxKind::Acoustic => "Makes an electric guitar DI sound like an acoustic",
+            FxKind::Plugin => "A CLAP or VST3 plugin installed on this computer",
         }
     }
 
@@ -180,6 +185,7 @@ impl FxKind {
             FxKind::Reverb => REVERB,
             FxKind::Utility => UTIL,
             FxKind::Acoustic => ACOUSTIC,
+            FxKind::Plugin => &[],
         }
     }
 }
@@ -191,6 +197,9 @@ pub struct FxSlot {
     pub kind: FxKind,
     pub on: bool,
     pub params: Vec<f32>,
+    /// Which plugin, and its saved settings, for [`FxKind::Plugin`] slots.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plugin: Option<PluginRef>,
 }
 
 impl FxSlot {
@@ -200,6 +209,22 @@ impl FxSlot {
             kind,
             on: true,
             params: kind.params().iter().map(|p| p.default).collect(),
+            plugin: None,
+        }
+    }
+
+    pub fn new_plugin(id: u64, plugin: PluginRef) -> Self {
+        Self {
+            plugin: Some(plugin),
+            ..Self::new(id, FxKind::Plugin)
+        }
+    }
+
+    /// The name to show for this effect.
+    pub fn title(&self) -> &str {
+        match &self.plugin {
+            Some(p) => &p.name,
+            None => self.kind.name(),
         }
     }
 
@@ -223,10 +248,37 @@ impl FxSlot {
 pub trait Effect: Send {
     fn set(&mut self, p: &[f32]);
     fn process(&mut self, l: &mut f32, r: &mut f32);
+    /// Process a block of stereo audio in place. Plugins work on blocks; built-in
+    /// effects just run sample by sample.
+    fn process_block(&mut self, l: &mut [f32], r: &mut [f32]) {
+        for (a, b) in l.iter_mut().zip(r.iter_mut()) {
+            self.process(a, b);
+        }
+    }
     fn reset(&mut self);
     /// Samples of delay this effect adds.
     fn latency(&self) -> usize {
         0
+    }
+    /// True for a stand-in (e.g. a plugin that isn't loaded yet); chains retry these.
+    fn is_placeholder(&self) -> bool {
+        false
+    }
+}
+
+/// Makes the running effect for a plugin slot (plugins are created on the UI thread).
+pub type PluginMaker<'a> = &'a mut dyn FnMut(&FxSlot) -> Option<Box<dyn Effect>>;
+
+/// Passes audio through untouched: used while a plugin is missing or not loaded.
+pub struct Placeholder;
+
+impl Effect for Placeholder {
+    fn set(&mut self, _: &[f32]) {}
+    fn process(&mut self, _: &mut f32, _: &mut f32) {}
+    fn process_block(&mut self, _: &mut [f32], _: &mut [f32]) {}
+    fn reset(&mut self) {}
+    fn is_placeholder(&self) -> bool {
+        true
     }
 }
 
@@ -242,6 +294,7 @@ pub fn build(kind: FxKind, sr: f32) -> Box<dyn Effect> {
         FxKind::Reverb => Box::new(Reverb::new(sr)),
         FxKind::Utility => Box::new(Utility::default()),
         FxKind::Acoustic => Box::new(Acoustic::new(sr)),
+        FxKind::Plugin => Box::new(Placeholder),
     }
 }
 
@@ -265,17 +318,37 @@ impl Chain {
         c
     }
 
+    pub fn from_slots_with(sr: f32, slots: &[FxSlot], make: PluginMaker) -> Self {
+        let mut c = Self::new(sr);
+        c.sync_with(slots, make);
+        c
+    }
+
     /// Match `slots`, keeping the running state of effects that are still there.
+    /// Plugin slots stay silent pass-throughs (use [`Chain::sync_with`] to load them).
     pub fn sync(&mut self, slots: &[FxSlot]) {
+        self.sync_with(slots, &mut |_| None);
+    }
+
+    /// Like [`Chain::sync`], asking `make` for any plugin that isn't running yet.
+    pub fn sync_with(&mut self, slots: &[FxSlot], make: PluginMaker) {
         let mut old = std::mem::take(&mut self.slots);
         for s in slots {
-            let mut fx = match old.iter().position(|o| o.0 == s.id && o.1 == s.kind) {
-                Some(i) => old.swap_remove(i).3,
+            let kept = old
+                .iter()
+                .position(|o| o.0 == s.id && o.1 == s.kind && !o.3.is_placeholder())
+                .map(|i| old.swap_remove(i).3);
+            let mut fx = match kept {
+                Some(fx) => fx,
+                None if s.kind == FxKind::Plugin => {
+                    make(s).unwrap_or_else(|| Box::new(Placeholder))
+                }
                 None => build(s.kind, self.sr),
             };
             fx.set(&s.values());
             self.slots.push((s.id, s.kind, s.on, fx));
         }
+        // Whatever is left in `old` is dropped here, on the caller's (UI) thread.
     }
 
     #[inline]
@@ -283,6 +356,14 @@ impl Chain {
         for (_, _, on, fx) in &mut self.slots {
             if *on {
                 fx.process(l, r);
+            }
+        }
+    }
+
+    pub fn process_block(&mut self, l: &mut [f32], r: &mut [f32]) {
+        for (_, _, on, fx) in &mut self.slots {
+            if *on {
+                fx.process_block(l, r);
             }
         }
     }
@@ -966,6 +1047,45 @@ mod tests {
         );
         let echo = out.iter().skip(10).position(|v| v.abs() > 0.3).unwrap() + 10;
         assert!((echo as i64 - 4800).abs() < 10, "echo at {echo}");
+    }
+
+    #[test]
+    fn plugin_slots_retry_until_loaded() {
+        let slot = FxSlot::new_plugin(
+            3,
+            PluginRef {
+                format: crate::plugins::PluginFormat::Clap,
+                path: "missing.clap".into(),
+                id: "x".into(),
+                name: "X".into(),
+                vendor: String::new(),
+                state: Vec::new(),
+            },
+        );
+        let mut c = Chain::new(SR);
+        c.sync(std::slice::from_ref(&slot));
+        let (mut l, mut r) = ([0.5f32; 4], [0.5f32; 4]);
+        c.process_block(&mut l, &mut r);
+        assert_eq!(l, [0.5; 4], "a missing plugin passes audio through");
+        struct Loaded;
+        impl Effect for Loaded {
+            fn set(&mut self, _: &[f32]) {}
+            fn process(&mut self, _: &mut f32, _: &mut f32) {}
+            fn reset(&mut self) {}
+        }
+        let mut asked = 0;
+        c.sync_with(std::slice::from_ref(&slot), &mut |_| {
+            asked += 1;
+            Some(Box::new(Loaded))
+        });
+        c.sync_with(std::slice::from_ref(&slot), &mut |_| {
+            asked += 1;
+            None
+        });
+        assert_eq!(
+            asked, 1,
+            "placeholders are replaced once the plugin can load, then kept"
+        );
     }
 
     #[test]

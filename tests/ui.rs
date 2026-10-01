@@ -19,7 +19,20 @@ fn x_at(secs: f32) -> f32 {
     X0 + secs * PPS
 }
 
+/// Points the app's settings/cache/autosave folder at a temp dir, so tests never touch
+/// the real one.
+fn isolate_app_data() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let dir = std::env::temp_dir().join(format!("unplugged-ui-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // SAFETY: done once, before any test reads it.
+        unsafe { std::env::set_var("APPDATA", dir) };
+    });
+}
+
 fn harness() -> Harness<'static, App> {
+    isolate_app_data();
     let mut h = HarnessBuilder::default()
         .with_size(Vec2::new(1400.0, 800.0))
         .wgpu()
@@ -265,4 +278,38 @@ fn add_effect_from_menu_and_undo() {
         1,
         "undo removes the added effect"
     );
+}
+
+#[test]
+fn real_plugin_on_a_track() {
+    // Uses Dragonfly Room Reverb if the test machine has it (set UNPLUGGED_TEST_CLAP).
+    let Some(path) = std::env::var_os("UNPLUGGED_TEST_CLAP") else {
+        eprintln!("skipping: UNPLUGGED_TEST_CLAP not set");
+        return;
+    };
+    // SAFETY: tests in this file don't read this variable concurrently.
+    unsafe { std::env::set_var("UNPLUGGED_HIDDEN_PLUGIN_WINDOWS", "1") };
+    let found = unplugged::plugins::scan();
+    let plugin = found
+        .iter()
+        .find(|p| std::path::Path::new(&p.path) == std::path::Path::new(&path))
+        .expect("the test plugin is found by the scan (put its folder in CLAP_PATH)");
+    let mut h = harness();
+    // Select the Lead clip's track, then add the plugin from the browser's data.
+    h.state_mut().add_plugin_for_test(plugin.to_ref());
+    steps(&mut h, 4);
+    let fx = &h.state().doc().tracks[1].fx;
+    assert_eq!(fx.last().unwrap().kind, unplugged::fx::FxKind::Plugin);
+    shot(&mut h, "plugin_slot");
+}
+
+#[test]
+fn plugin_browser_free_tab() {
+    use egui_kittest::kittest::Queryable;
+    let mut h = harness();
+    h.get_by_label("Plugins").click();
+    steps(&mut h, 3);
+    h.get_by_label("Get free plugins").click();
+    steps(&mut h, 3);
+    shot(&mut h, "plugin_browser");
 }
