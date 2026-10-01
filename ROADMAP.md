@@ -19,14 +19,34 @@ Legend: size **S** is about a day, **M** a few days, **L** a week or more. ✅ =
 | Feature | Why | Size |
 |---|---|---|
 | **Tuner** | Every guitar session starts with one | S |
-| **Count-in** (1 bar before recording) | Easier to start takes on the beat | S |
+| ✅ **Count-in** (1 bar before recording) | Easier to start takes on the beat | S |
 | **Auto latency calibration** (loopback ping out → in) | Takes line up without guessing the "Latency ms" slider | M |
-| **Undo/redo** | Deleting a take by accident hurts | M |
-| **Trim/split/move clips** and fades | Cut out bad starts and endings | M |
+| ✅ **Undo/redo** | Deleting a take by accident hurts | M |
+| ✅ **Trim/split/move clips** (fades still to do) | Cut out bad starts and endings | M |
+| ✅ **Live waveform while recording**, selection, Delete key, right-click menus, Reaper-style shortcuts | Basic DAW feel | M |
 | **Loop recording** (record a region repeatedly, keep the best take) | The main layering workflow | M |
-| **Autosave takes to disk while recording** | Never lose a take to a crash | S |
+| ½ **Autosave**: ✅ background autosave + crash recovery every 30 s; writing takes *while* recording still to do | Never lose a take to a crash | S |
 | **Prebuilt Windows releases with ASIO** (GitHub Actions) | Low latency without installing Rust or the ASIO SDK | M |
 | More acoustic voices (dreadnought, parlor, nylon) as built-in IRs | Different acoustic flavours | S |
+
+## Things other DAWs never fixed
+
+Simple features users have asked DAW makers for over years, often with hundreds of votes, that never shipped. They're cheap wins for a free DAW. (Researched October 2026; vote counts are from the linked pages.)
+
+| Feature | Asked of | Since | Evidence | Unplugged |
+|---|---|---|---|---|
+| Undo "delete track" | Pro Tools | 2010 | Top unshipped IdeaScale idea, ~1,200 votes ([Sound On Sound](https://www.soundonsound.com/techniques/pro-tools-most-wanted-features)) | ✅ |
+| Autosave that runs in the background and doesn't freeze the app | Studio One | 2016 | +504 votes ([PreSonus feedback](https://feedback-software.presonus.com/feedback/139352)) | ✅ |
+| Autosave at all (Live only has crash recovery) | Ableton Live | 2009 | Threads 2009–2023 ([Ableton forum](https://forum.ableton.com/viewtopic.php?t=247691)) | ✅ |
+| Always-on audio capture (keep what you played before hitting record) | Bitwig, most DAWs | years | 60-post KVR thread; paid plugins exist to fill the gap ([KVR](https://www.kvraudio.com/forum/viewtopic.php?p=8538428)) | ✅ ⟲ Capture |
+| Polarity flip on every channel | Pro Tools | 2009 | IdeaScale top 10 ([SOS](https://www.soundonsound.com/techniques/pro-tools-most-wanted-features)) | ✅ |
+| Save/load effect chains | Pro Tools | 2009 | IdeaScale #3 ([Production Expert](https://www.production-expert.com/home-page/2016/6/29/pro-tools-ideascale-top-20-saveload-plug-in-chains)) | ✅ sim presets |
+| Built-in LUFS meter | Ableton Live | ~2015 | Several threads ([Ableton forum](https://forum.ableton.com/viewtopic.php?t=239115)) | ½ export matches LUFS; live meter next |
+| Export every track as a stem in one go | GarageBand | years | Apple Community threads ([Apple](https://discussions.apple.com/thread/254890741)) | next |
+| Better markers | Pro Tools | 2009 | IdeaScale #4 ([SOS](https://www.soundonsound.com/techniques/pro-tools-most-wanted-features)) | next |
+| Split a stereo file into two mono tracks | Studio One | 2016 | ([PreSonus feedback](https://feedback-software.presonus.com/feedback/139381)) | planned |
+| Mute part of a clip / join two clips | Audacity | 2023 | GitHub [#5064](https://github.com/audacity/audacity/issues/5064), [#5509](https://github.com/audacity/audacity/issues/5509) | planned (join = "heal split") |
+| Several projects open at once (tabs) | Pro Tools, FL Studio | ~2009 | IdeaScale #6 ([Production Expert 2026](https://www.production-expert.com/production-expert-1/3-pro-tools-features-still-missing-in-2026)) | later |
 
 ## Phase 2: Share exporter (the big one)
 

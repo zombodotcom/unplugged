@@ -1,75 +1,33 @@
 //! The real-time engine: live monitoring, track playback, recording and the metronome.
 //!
 //! The engine lives behind a mutex. The audio thread only ever `try_lock`s it and the
-//! UI thread keeps its critical sections tiny (heavy work like building tracks or
-//! loading IRs happens outside the lock).
+//! UI thread keeps its critical sections tiny. The UI owns the song ([`crate::model::Doc`])
+//! and pushes a copy here with [`Engine::set_tracks`] whenever it changes; clips share
+//! their audio through `Arc`s, so that copy is cheap.
 
 use crate::dsp::{AcousticSim, IrSpectrum, SimParams, builtin_body_ir};
+use crate::model::Track;
 use std::collections::VecDeque;
 use std::f32::consts::PI;
 use std::sync::Arc;
 
-/// Samples per waveform peak bucket.
-pub const PEAK_BUCKET: usize = 256;
-
-pub struct Track {
-    pub id: u64,
-    pub name: String,
-    pub samples: Arc<Vec<f32>>,
-    pub peaks: Arc<Vec<[f32; 2]>>,
-    /// Position of the first sample on the timeline, in samples.
-    pub start: usize,
-    pub volume: f32,
-    /// -1 = left, 0 = centre, 1 = right.
-    pub pan: f32,
-    pub mute: bool,
-    pub solo: bool,
-    /// Run this track through the acoustic simulator on playback.
-    pub acoustic: bool,
+struct EngineTrack {
+    data: Track,
     sim: AcousticSim,
-}
-
-/// Plain copy of a track's settings, for the UI and for saving.
-#[derive(Clone)]
-pub struct TrackView {
-    pub id: u64,
-    pub name: String,
-    pub samples: Arc<Vec<f32>>,
-    pub peaks: Arc<Vec<[f32; 2]>>,
-    pub start: usize,
-    pub volume: f32,
-    pub pan: f32,
-    pub mute: bool,
-    pub solo: bool,
-    pub acoustic: bool,
-}
-
-impl TrackView {
-    pub fn end(&self) -> usize {
-        self.start + self.samples.len()
-    }
-}
-
-pub fn compute_peaks(samples: &[f32]) -> Vec<[f32; 2]> {
-    samples
-        .chunks(PEAK_BUCKET)
-        .map(|c| {
-            c.iter()
-                .fold([0.0f32, 0.0f32], |[lo, hi], &s| [lo.min(s), hi.max(s)])
-        })
-        .collect()
 }
 
 pub struct Engine {
     pub sr: f32,
-    tracks: Vec<Track>,
-    next_id: u64,
+    tracks: Vec<EngineTrack>,
 
     pub playing: bool,
     pub playhead: usize,
     pub recording: bool,
     rec_buf: Vec<f32>,
     rec_start: usize,
+    /// Samples of count-in left before recording really starts.
+    count_in: usize,
+    count_in_total: usize,
 
     pub monitor: bool,
     pub input_gain: f32,
@@ -79,12 +37,15 @@ pub struct Engine {
     pub click_volume: f32,
     /// Round-trip latency to compensate recordings by, in milliseconds.
     pub latency_ms: f32,
-    /// Default "acoustic" flag for new recordings.
-    pub record_acoustic: bool,
 
     params: SimParams,
     ir: Arc<IrSpectrum>,
     monitor_sim: AcousticSim,
+
+    /// The last [`CAPTURE_SECONDS`] of input, always recording (for "Capture").
+    history: Vec<f32>,
+    hist_pos: usize,
+    hist_len: usize,
 
     /// Peak meters, reset by the UI when read.
     pub in_peak: f32,
@@ -98,12 +59,13 @@ impl Engine {
         Self {
             sr,
             tracks: Vec::new(),
-            next_id: 1,
             playing: false,
             playhead: 0,
             recording: false,
             rec_buf: Vec::new(),
             rec_start: 0,
+            count_in: 0,
+            count_in_total: 0,
             monitor: true,
             input_gain: 1.0,
             master: 0.8,
@@ -111,10 +73,12 @@ impl Engine {
             bpm: 90.0,
             click_volume: 0.4,
             latency_ms: 12.0,
-            record_acoustic: true,
             monitor_sim: AcousticSim::new(sr, &params, ir.clone()),
             params,
             ir,
+            history: vec![0.0; (CAPTURE_SECONDS * sr) as usize],
+            hist_pos: 0,
+            hist_len: 0,
             in_peak: 0.0,
             out_peak: 0.0,
         }
@@ -160,74 +124,40 @@ impl Engine {
         for t in &mut self.tracks {
             t.sim = AcousticSim::new(sr, &self.params, self.ir.clone());
         }
+        self.history = vec![0.0; (CAPTURE_SECONDS * sr) as usize];
+        self.hist_pos = 0;
+        self.hist_len = 0;
+    }
+
+    /// The last `seconds` of input (oldest first), whether or not you were recording.
+    pub fn captured(&self, seconds: f32) -> Vec<f32> {
+        let n = ((seconds * self.sr) as usize).min(self.hist_len);
+        let cap = self.history.len();
+        let start = (self.hist_pos + cap - n) % cap;
+        (0..n).map(|i| self.history[(start + i) % cap]).collect()
     }
 
     // ---- tracks ----------------------------------------------------------
 
-    pub fn new_sim(&self) -> AcousticSim {
-        AcousticSim::new(self.sr, &self.params, self.ir.clone())
-    }
-
-    pub fn views(&self) -> Vec<TrackView> {
-        self.tracks
-            .iter()
-            .map(|t| TrackView {
-                id: t.id,
-                name: t.name.clone(),
-                samples: t.samples.clone(),
-                peaks: t.peaks.clone(),
-                start: t.start,
-                volume: t.volume,
-                pan: t.pan,
-                mute: t.mute,
-                solo: t.solo,
-                acoustic: t.acoustic,
-            })
-            .collect()
-    }
-
-    /// Add a track. `sim` should come from [`Engine::new_sim`] (built outside the lock).
-    pub fn add_track(&mut self, mut v: TrackView, sim: AcousticSim) -> u64 {
-        v.id = self.next_id;
-        self.next_id += 1;
-        self.tracks.push(Track {
-            id: v.id,
-            name: v.name,
-            samples: v.samples,
-            peaks: v.peaks,
-            start: v.start,
-            volume: v.volume,
-            pan: v.pan,
-            mute: v.mute,
-            solo: v.solo,
-            acoustic: v.acoustic,
-            sim,
-        });
-        v.id
-    }
-
-    /// Apply edited settings from the UI (name, volume, pan, mute, solo, acoustic, start).
-    pub fn update_track(&mut self, v: &TrackView) {
-        if let Some(t) = self.tracks.iter_mut().find(|t| t.id == v.id) {
-            t.name.clone_from(&v.name);
-            t.start = v.start;
-            t.volume = v.volume;
-            t.pan = v.pan;
-            t.mute = v.mute;
-            t.solo = v.solo;
-            if t.acoustic != v.acoustic {
-                t.sim.reset();
-            }
-            t.acoustic = v.acoustic;
+    /// Replace the playing song with `tracks`, keeping each track's effect state.
+    pub fn set_tracks(&mut self, tracks: &[Track]) {
+        let mut old: Vec<EngineTrack> = std::mem::take(&mut self.tracks);
+        for t in tracks {
+            let sim = match old.iter().position(|o| o.data.id == t.id) {
+                Some(i) => {
+                    let mut o = old.swap_remove(i);
+                    if o.data.acoustic != t.acoustic {
+                        o.sim.reset();
+                    }
+                    o.sim
+                }
+                None => AcousticSim::new(self.sr, &self.params, self.ir.clone()),
+            };
+            self.tracks.push(EngineTrack {
+                data: t.clone(),
+                sim,
+            });
         }
-    }
-
-    pub fn remove_track(&mut self, id: u64) {
-        self.tracks.retain(|t| t.id != id);
-    }
-
-    pub fn clear_tracks(&mut self) {
-        self.tracks.clear();
     }
 
     // ---- transport -------------------------------------------------------
@@ -240,6 +170,7 @@ impl Engine {
     /// as `(start, samples)`.
     pub fn stop(&mut self) -> Option<(usize, Vec<f32>)> {
         self.playing = false;
+        self.count_in = 0;
         self.reset_sims();
         if !self.recording {
             return None;
@@ -257,14 +188,22 @@ impl Engine {
         (!take.is_empty()).then_some((start, take))
     }
 
-    /// Starts recording a new layer at the playhead (and starts playback).
-    /// `buf` should be pre-allocated by the caller so the audio thread rarely allocates.
-    pub fn record(&mut self, buf: Vec<f32>) {
+    /// Starts recording a new layer at the playhead (and starts playback), after
+    /// `count_in_beats` clicks. `buf` should be pre-allocated by the caller so the
+    /// audio thread rarely allocates.
+    pub fn record(&mut self, buf: Vec<f32>, count_in_beats: u32) {
         self.rec_buf = buf;
         self.rec_buf.clear();
         self.rec_start = self.playhead;
+        self.count_in_total = count_in_beats as usize * self.beat_len();
+        self.count_in = self.count_in_total;
         self.recording = true;
         self.playing = true;
+    }
+
+    /// True while the count-in clicks are playing.
+    pub fn counting_in(&self) -> bool {
+        self.count_in > 0
     }
 
     pub fn recording_len(&self) -> usize {
@@ -273,6 +212,13 @@ impl Engine {
 
     pub fn recording_start(&self) -> usize {
         self.rec_start
+    }
+
+    /// Copies recorded samples from index `from` onwards into `out` (for live waveforms).
+    pub fn recorded_since(&self, from: usize, out: &mut Vec<f32>) {
+        if let Some(s) = self.rec_buf.get(from..) {
+            out.extend_from_slice(s);
+        }
     }
 
     pub fn seek(&mut self, pos: usize) {
@@ -291,8 +237,12 @@ impl Engine {
 
     // ---- audio -----------------------------------------------------------
 
+    fn beat_len(&self) -> usize {
+        (self.sr * 60.0 / self.bpm.max(20.0)) as usize
+    }
+
     fn click(&self, pos: usize) -> f32 {
-        let beat = (self.sr * 60.0 / self.bpm.max(20.0)) as usize;
+        let beat = self.beat_len();
         let beat_idx = pos / beat;
         let t = (pos % beat) as f32;
         let len = 0.03 * self.sr;
@@ -309,13 +259,14 @@ impl Engine {
 
     /// Render `out.len() / 2` stereo frames. Consumes one mono input sample per frame.
     pub fn render(&mut self, input: &mut VecDeque<f32>, out: &mut [f32]) {
-        let any_solo = self.tracks.iter().any(|t| t.solo);
+        let any_solo = self.tracks.iter().any(|t| t.data.solo);
         for frame in out.chunks_exact_mut(2) {
             let x = input.pop_front().unwrap_or(0.0) * self.input_gain;
             self.in_peak = self.in_peak.max(x.abs());
-
-            if self.recording {
-                self.rec_buf.push(x);
+            if !self.history.is_empty() {
+                self.history[self.hist_pos] = x;
+                self.hist_pos = (self.hist_pos + 1) % self.history.len();
+                self.hist_len = (self.hist_len + 1).min(self.history.len());
             }
 
             let mut l = 0.0;
@@ -326,21 +277,27 @@ impl Engine {
                 r += m;
             }
 
-            if self.playing {
+            if self.playing && self.count_in > 0 {
+                // Count-in: clicks only, the song waits.
+                let c = self.click(self.count_in_total - self.count_in);
+                l += c;
+                r += c;
+                self.count_in -= 1;
+            } else if self.playing {
+                if self.recording {
+                    self.rec_buf.push(x);
+                }
                 let pos = self.playhead;
                 for t in &mut self.tracks {
-                    let audible = !t.mute && (!any_solo || t.solo);
-                    let s = if pos >= t.start && pos < t.start + t.samples.len() {
-                        t.samples[pos - t.start]
-                    } else {
-                        0.0
-                    };
-                    // Keep the sim running a bit past the clip end so its tail rings out.
-                    let s = if t.acoustic { t.sim.process(s) } else { s };
+                    let audible = !t.data.mute && (!any_solo || t.data.solo);
+                    let s = t.data.sample_at(pos);
+                    let s = if t.data.invert { -s } else { s };
+                    // The sim keeps running between clips so its tail rings out.
+                    let s = if t.data.acoustic { t.sim.process(s) } else { s };
                     if audible {
-                        let angle = (t.pan + 1.0) * PI / 4.0;
-                        l += s * t.volume * angle.cos();
-                        r += s * t.volume * angle.sin();
+                        let angle = (t.data.pan + 1.0) * PI / 4.0;
+                        l += s * t.data.volume * angle.cos();
+                        r += s * t.data.volume * angle.sin();
                     }
                 }
                 if self.metronome {
@@ -369,31 +326,31 @@ fn soft_clip(x: f32) -> f32 {
     }
 }
 
-/// Offline mixdown of the whole session to interleaved stereo.
-pub fn render_mix(
-    tracks: &[TrackView],
-    params: &SimParams,
-    ir: Arc<IrSpectrum>,
-    sr: f32,
-) -> Vec<f32> {
+/// How much input "Capture" can grab after the fact.
+pub const CAPTURE_SECONDS: f32 = 60.0;
+
+/// Offline mixdown of the whole song to interleaved stereo.
+pub fn render_mix(tracks: &[Track], params: &SimParams, ir: Arc<IrSpectrum>, sr: f32) -> Vec<f32> {
     let tail = (sr * 2.0) as usize;
-    let len = tracks.iter().map(|t| t.end()).max().unwrap_or(0) + tail;
+    let len = tracks.iter().map(Track::end).max().unwrap_or(0) + tail;
     let lat = crate::dsp::CONV_BLOCK;
     let any_solo = tracks.iter().any(|t| t.solo);
     let mut mix = vec![0.0f32; len * 2];
     for t in tracks.iter().filter(|t| !t.mute && (!any_solo || t.solo)) {
         let angle = (t.pan + 1.0) * PI / 4.0;
         let (gl, gr) = (t.volume * angle.cos(), t.volume * angle.sin());
+        let wet = t.acoustic && params.enabled;
         let mut sim = AcousticSim::new(sr, params, ir.clone());
-        let n = t.samples.len() + tail;
-        for i in 0..n + lat {
-            let s = t.samples.get(i).copied().unwrap_or(0.0);
-            let (y, at) = if t.acoustic && params.enabled {
-                (sim.process(s), i.checked_sub(lat))
+        let first = t.start();
+        let sign = if t.invert { -1.0 } else { 1.0 };
+        for pos in first..len + if wet { lat } else { 0 } {
+            let s = t.sample_at(pos) * sign;
+            let (y, at) = if wet {
+                (sim.process(s), pos.checked_sub(lat))
             } else {
-                (s, Some(i))
+                (s, Some(pos))
             };
-            if let Some(at) = at.map(|a| a + t.start).filter(|&a| a < len) {
+            if let Some(at) = at.filter(|&a| a < len && a >= first) {
                 mix[at * 2] += y * gl;
                 mix[at * 2 + 1] += y * gr;
             }
@@ -417,6 +374,7 @@ pub fn render_mix(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::Doc;
 
     #[test]
     fn records_and_compensates_latency() {
@@ -424,7 +382,7 @@ mod tests {
         e.monitor = false;
         e.latency_ms = 10.0; // 480 samples
         e.seek(1000);
-        e.record(Vec::with_capacity(4096));
+        e.record(Vec::with_capacity(4096), 0);
         let mut input: VecDeque<f32> = (0..2000).map(|i| i as f32).collect();
         let mut out = vec![0.0; 4000];
         e.render(&mut input, &mut out);
@@ -438,7 +396,7 @@ mod tests {
     fn latency_trims_take_at_zero() {
         let mut e = Engine::new(48000.0);
         e.latency_ms = 10.0;
-        e.record(Vec::new());
+        e.record(Vec::new(), 0);
         let mut input: VecDeque<f32> = (0..1000).map(|i| i as f32).collect();
         let mut out = vec![0.0; 2000];
         e.render(&mut input, &mut out);
@@ -449,31 +407,67 @@ mod tests {
     }
 
     #[test]
-    fn plays_back_tracks() {
+    fn count_in_delays_recording() {
+        let mut e = Engine::new(48000.0);
+        e.monitor = false;
+        e.latency_ms = 0.0;
+        e.bpm = 120.0; // 24000 samples per beat
+        e.record(Vec::new(), 1);
+        let mut input: VecDeque<f32> = (0..30000).map(|i| i as f32).collect();
+        let mut out = vec![0.0; 60000];
+        e.render(&mut input, &mut out);
+        assert!(!e.counting_in());
+        assert_eq!(e.playhead, 6000);
+        let (start, take) = e.stop().unwrap();
+        assert_eq!(start, 0);
+        assert_eq!(take.len(), 6000);
+        assert_eq!(take[0], 24000.0, "count-in audio isn't recorded");
+    }
+
+    #[test]
+    fn capture_returns_recent_input_in_order() {
+        let mut e = Engine::new(1000.0); // 60 s history = 60000 samples
+        e.monitor = false;
+        let mut input: VecDeque<f32> = (0..70000).map(|i| i as f32).collect();
+        let mut out = vec![0.0; 140000];
+        e.render(&mut input, &mut out);
+        let c = e.captured(2.0);
+        assert_eq!(c.len(), 2000);
+        assert_eq!(c[0], 68000.0);
+        assert_eq!(*c.last().unwrap(), 69999.0);
+        assert_eq!(e.captured(100.0).len(), 60000);
+    }
+
+    #[test]
+    fn plays_back_clips() {
         let mut e = Engine::new(48000.0);
         e.monitor = false;
         e.master = 1.0;
-        let samples = Arc::new(vec![0.5f32; 100]);
-        let sim = e.new_sim();
-        e.add_track(
-            TrackView {
-                id: 0,
-                name: "t".into(),
-                peaks: Arc::new(compute_peaks(&samples)),
-                samples,
-                start: 10,
-                volume: 1.0,
-                pan: 0.0,
-                mute: false,
-                solo: false,
-                acoustic: false,
-            },
-            sim,
-        );
+        let mut d = Doc::new();
+        let clip = d.make_clip(vec![0.5f32; 100], 10);
+        let tid = d.add_track("t".into(), Some(clip), false);
+        d.track_mut(tid).unwrap().volume = 1.0;
+        e.set_tracks(&d.tracks);
         e.play();
         let mut out = vec![0.0; 400];
         e.render(&mut VecDeque::new(), &mut out);
         assert_eq!(out[0], 0.0);
         assert!((out[20] - 0.5 * (PI / 4.0).cos()).abs() < 1e-5);
+    }
+
+    #[test]
+    fn mix_follows_splits_and_trims() {
+        let mut d = Doc::new();
+        let clip = d.make_clip(vec![0.25f32; 4800], 0);
+        let id = clip.id;
+        d.add_track("t".into(), Some(clip), false);
+        d.trim_end(id, 2400);
+        let mix = render_mix(
+            &d.tracks,
+            &SimParams::default(),
+            Arc::new(IrSpectrum::new("x", &[1.0])),
+            48000.0,
+        );
+        assert_eq!(mix.len(), 2400 * 2);
     }
 }

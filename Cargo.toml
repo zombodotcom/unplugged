@@ -1,6 +1,6 @@
 [package]
 name = "unplugged"
-version = "0.2.0"
+version = "0.3.0"
 description = "Play electric guitar DI and hear it as an acoustic - a tiny multitrack recorder"
 license = "MIT"
 repository = "https://github.com/zombodotcom/unplugged"
@@ -29,3 +29,6 @@ asio = ["cpal/asio"]
 [profile.dev]
 # Audio DSP is too slow unoptimised; keep debug builds usable.
 opt-level = 2
+
+[dev-dependencies]
+egui_kittest = { version = "0.36", features = ["wgpu", "snapshot", "eframe"] }
